@@ -1,45 +1,91 @@
-name: Manometer Reader
-version: "0.1.0"
-slug: manometer_reader
-description: Reads an analog gauge from RTSP and publishes the value via MQTT
-# url: "https://github.com/CrazyHAEBDF/ha-addons/tree/main/manometer_reader"
+name: "Manometer Reader"
+version: "0.3.0"
+slug: "manometer_reader"
+description: "Liest ein analoges Heizungsmanometer per RTSP/OpenCV und veröffentlicht den Druck per MQTT."
+url: "https://github.com/DEIN_GITHUB_NAME/ha-addons"
 arch:
   - aarch64
   - amd64
   - armv7
-  - armhf
-  - i386
 startup: services
 boot: auto
+init: false
+map:
+  - type: addon_config
+    read_only: false
 
 options:
-  rtsp_url: ""
-  interval_sec: 10
+  rtsp_url: null
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
-  mqtt_topic: "home/manometer/pressure"
-  roi: [0, 0, 0, 0]
-  center: [0, 0]
-  angle_min_deg: 225
-  angle_max_deg: 315
-  value_min: 0.0
-  value_max: 3.0
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_base_topic: "manometer/heizung"
+  mqtt_discovery_prefix: "homeassistant"
+
+  interval_sec: 15
+
+  roi_x: 982
+  roi_y: 502
+  roi_w: 60
+  roi_h: 60
+
+  center_x: 30
+  center_y: 30
+  radius: 24
+
+  angle_min_deg: 225.0
+  angle_max_deg: 315.0
+  scale_min: 0.0
+  scale_max: 4.0
+  clockwise: true
+
+  search_max_value: 3.2
+  scan_inner_ratio: 0.25
+  scan_outer_ratio: 0.62
+  line_half_width_px: 1
+  processing_scale: 4
+
+  median_window: 5
+  confidence_min: 1.0
+  failures_until_unavailable: 3
+
+  debug: true
 
 schema:
   rtsp_url: str
-  interval_sec: int(1,3600)
   mqtt_host: str
-  mqtt_port: int(1,65535)
-  mqtt_topic: str
-  roi:
-    - int
-    - int
-    - int
-    - int
-  center:
-    - int
-    - int
+  mqtt_port: port
+  mqtt_username: str
+  mqtt_password: password
+  mqtt_base_topic: str
+  mqtt_discovery_prefix: str
+
+  interval_sec: "int(5,3600)"
+
+  roi_x: "int(0,10000)"
+  roi_y: "int(0,10000)"
+  roi_w: "int(20,5000)"
+  roi_h: "int(20,5000)"
+
+  center_x: "int(0,5000)"
+  center_y: "int(0,5000)"
+  radius: "int(5,2500)"
+
   angle_min_deg: float
   angle_max_deg: float
-  value_min: float
-  value_max: float
+  scale_min: float
+  scale_max: float
+  clockwise: bool
+
+  search_max_value: float
+  scan_inner_ratio: float
+  scan_outer_ratio: float
+  line_half_width_px: "int(0,20)"
+  processing_scale: "int(1,8)"
+
+  median_window: "int(1,15)"
+  confidence_min: float
+  failures_until_unavailable: "int(1,20)"
+
+  debug: bool

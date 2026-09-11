@@ -1,2 +1,5 @@
-#!/usr/bin/with-contenv sh
-python /gauge_reader.py
+#!/usr/bin/with-contenv bashio
+set -e
+
+bashio::log.info "Starte Manometer Reader ..."
+exec python3 /gauge_reader.py
