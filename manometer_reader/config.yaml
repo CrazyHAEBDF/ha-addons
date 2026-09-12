@@ -1,21 +1,24 @@
 name: "Manometer Reader"
-version: "0.3.0"
+version: "0.3.1"
 slug: "manometer_reader"
 description: "Liest ein analoges Heizungsmanometer per RTSP/OpenCV und veröffentlicht den Druck per MQTT."
-url: "https://github.com/CrazyHAEBDF/ha-addons"
+url: "https://github.com/DEIN_GITHUB_NAME/ha-addons"
+
 arch:
   - aarch64
   - amd64
   - armv7
+
 startup: services
 boot: auto
 init: false
+
 map:
   - type: addon_config
     read_only: false
 
 options:
-  rtsp_url: null
+  rtsp_url: ""
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_username: ""
@@ -40,9 +43,10 @@ options:
   scale_max: 4.0
   clockwise: true
 
-  search_max_value: 3.2
-  scan_inner_ratio: 0.25
-  scan_outer_ratio: 0.62
+  search_max_value: 4.0
+
+  scan_inner_ratio: 0.40
+  scan_outer_ratio: 0.85
   line_half_width_px: 1
   processing_scale: 4
 
@@ -57,7 +61,7 @@ schema:
   mqtt_host: str
   mqtt_port: port
   mqtt_username: str
-  mqtt_password: password
+  mqtt_password: str
   mqtt_base_topic: str
   mqtt_discovery_prefix: str
 
