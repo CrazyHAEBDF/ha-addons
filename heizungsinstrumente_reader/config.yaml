@@ -1,0 +1,118 @@
+name: "Heizungs Instrument Reader"
+version: "1.0.0"
+slug: "instrument_reader"
+description: "Liest Heizungsdruck, Rücklauf- und Zulauftemperatur gemeinsam aus einem RTSP-Bild und veröffentlicht alles per MQTT."
+url: "https://github.com/DEIN_GITHUB_NAME/ha-addons"
+
+arch: [aarch64, amd64, armv7]
+startup: services
+boot: auto
+init: false
+map:
+  - type: addon_config
+    read_only: false
+
+options:
+  rtsp_url: ""
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_base_topic: "heizung/instrumente"
+  mqtt_discovery_prefix: "homeassistant"
+
+  interval_sec: 15
+  capture_timeout_sec: 12
+  backoff_max_sec: 300
+  locate_interval_sec: 600
+  relocate_after_invalid: 2
+
+  cluster_confirmations: 3
+  cluster_confirmation_px: 18
+  cluster_confirmation_angle_deg: 8.0
+  cluster_gauge_offset_x_ratio: 0.73
+  cluster_gauge_offset_y_ratio: 1.61
+  cluster_tolerance: 0.32
+  cluster_min_spacing_r: 2.2
+  cluster_max_spacing_r: 8.0
+  cluster_prior_radius_px: 400
+  cluster_min_radius_px: 14
+  cluster_max_radius_px: 38
+  cluster_zone_x_min: 0.40
+  cluster_zone_x_max: 0.68
+  cluster_zone_y_min: 0.22
+  cluster_zone_y_max: 0.60
+  reference_gauge_x: 1155
+  reference_gauge_y: 535
+  reference_gauge_radius: 24
+  rebaseline_on_start: false
+
+  thermometer_angle_20_deg: 315.0
+  thermometer_angle_100_deg: 225.0
+  thermometer_needle_center_x_ratio: 0.0
+  thermometer_needle_center_y_ratio: -0.55
+  thermometer_scan_inner_ratio: 0.12
+  thermometer_scan_outer_ratio: 0.98
+  thermometer_processing_scale: 4
+
+  pressure_angle_0_deg: 225.0
+  pressure_angle_4_deg: 315.0
+  pressure_scan_inner_ratio: 0.40
+  pressure_scan_outer_ratio: 0.92
+  pressure_processing_scale: 3
+
+  line_half_width_px: 1
+  confidence_min: 1.0
+  median_window: 5
+  failures_until_unavailable: 3
+  debug: true
+
+schema:
+  rtsp_url: str
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_username: str
+  mqtt_password: str
+  mqtt_base_topic: str
+  mqtt_discovery_prefix: str
+  interval_sec: "int(15,3600)"
+  capture_timeout_sec: "int(5,60)"
+  backoff_max_sec: "int(30,3600)"
+  locate_interval_sec: "int(60,86400)"
+  relocate_after_invalid: "int(1,20)"
+  cluster_confirmations: "int(1,10)"
+  cluster_confirmation_px: "int(1,200)"
+  cluster_confirmation_angle_deg: float
+  cluster_gauge_offset_x_ratio: float
+  cluster_gauge_offset_y_ratio: float
+  cluster_tolerance: float
+  cluster_min_spacing_r: float
+  cluster_max_spacing_r: float
+  cluster_prior_radius_px: "int(0,2000)"
+  cluster_min_radius_px: "int(5,100)"
+  cluster_max_radius_px: "int(10,150)"
+  cluster_zone_x_min: float
+  cluster_zone_x_max: float
+  cluster_zone_y_min: float
+  cluster_zone_y_max: float
+  reference_gauge_x: "int(0,10000)"
+  reference_gauge_y: "int(0,10000)"
+  reference_gauge_radius: "int(5,2500)"
+  rebaseline_on_start: bool
+  thermometer_angle_20_deg: float
+  thermometer_angle_100_deg: float
+  thermometer_needle_center_x_ratio: float
+  thermometer_needle_center_y_ratio: float
+  thermometer_scan_inner_ratio: float
+  thermometer_scan_outer_ratio: float
+  thermometer_processing_scale: "int(1,8)"
+  pressure_angle_0_deg: float
+  pressure_angle_4_deg: float
+  pressure_scan_inner_ratio: float
+  pressure_scan_outer_ratio: float
+  pressure_processing_scale: "int(1,8)"
+  line_half_width_px: "int(0,20)"
+  confidence_min: float
+  median_window: "int(1,15)"
+  failures_until_unavailable: "int(1,20)"
+  debug: bool
