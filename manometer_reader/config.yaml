@@ -1,7 +1,7 @@
 name: "Manometer Reader"
-version: "0.4.0"
+version: "0.4.1"
 slug: "manometer_reader"
-description: "Liest ein analoges Heizungsmanometer per RTSP/OpenCV, verfolgt es automatisch im Bild und veröffentlicht Druck und Diagnose per MQTT."
+description: "Liest Heizungsdruck über das feste 3er-Muster aus zwei Thermometern und Manometer und veröffentlicht Diagnose per MQTT."
 url: "https://github.com/DEIN_GITHUB_NAME/ha-addons"
 
 arch:
@@ -38,6 +38,15 @@ options:
   movement_warning_px: 18
   radius_warning_percent: 20
   rebaseline_on_start: false
+
+  cluster_confirmations: 3
+  cluster_vertical_ratio: 0.80
+  cluster_tolerance: 0.42
+  cluster_min_spacing_r: 2.2
+  cluster_max_spacing_r: 8.0
+  cluster_prior_radius_px: 400
+  cluster_confirmation_px: 18
+  cluster_confirmation_angle_deg: 8.0
 
   roi_x: 982
   roi_y: 502
@@ -89,6 +98,15 @@ schema:
   movement_warning_px: "int(1,1000)"
   radius_warning_percent: "int(1,100)"
   rebaseline_on_start: bool
+
+  cluster_confirmations: "int(1,10)"
+  cluster_vertical_ratio: float
+  cluster_tolerance: float
+  cluster_min_spacing_r: float
+  cluster_max_spacing_r: float
+  cluster_prior_radius_px: "int(0,2000)"
+  cluster_confirmation_px: "int(1,200)"
+  cluster_confirmation_angle_deg: float
 
   roi_x: "int(0,10000)"
   roi_y: "int(0,10000)"

@@ -1,52 +1,72 @@
-# Manometer Reader 0.4.0
+# Manometer Reader 0.4.1
 
-Home-Assistant-App für ein analoges Heizungsmanometer über RTSP/Tapo + OpenCV + MQTT.
+Home-Assistant-App für die anlagenspezifische Erkennung eines analogen
+Heizungsmanometers über RTSP/Tapo, OpenCV und MQTT.
 
-## Neu in 0.4.0
+## Neu in 0.4.1
 
-- automatische Lokalisierung des Manometers
-- automatische Nachführung, wenn die Kamera verschoben wurde
-- persistente Referenz in `/config/calibration.json`
-- Template des Manometers in `/config/gauge_template.jpg`
-- Warnung `Kamera verschoben` per MQTT Discovery
-- Diagnose-Entities für Position, Radius, Qualität und Status
-- Druck wird bei fehlender/unsicherer Erkennung `unavailable`; echte 0 bar bleiben ein gültiger Messwert
-- CPU-schonender Standard: Messung alle 60 s, ffmpeg mit niedriger Priorität und einem Decoder-Thread
-- exponentieller Backoff bei RTSP-Fehlern
-- Zeigersuche gewichtet den äußeren Radius stärker, damit der lange dünne Messzeiger gegenüber dem kurzen breiten Gegengewicht bevorzugt wird
+- sucht nicht mehr einen beliebigen Einzelkreis
+- erkennt das feste Dreieck aus Thermometer 1, Thermometer 2 und Manometer
+- bewertet Abstände, relative Lage und Radien normiert; Verschieben, Zoomen und
+  moderate Kameradrehung bleiben möglich
+- akzeptiert eine neue Erstkalibrierung erst nach drei übereinstimmenden Bildern
+- korrigiert die Skalenwinkel anhand der erkannten Kameradrehung
+- zeichnet alle Kreiskandidaten sowie T1, T2 und das gewählte Manometer ins
+  Debug-Vollbild
+- ignoriert die fehlerhafte Einzelkreis-Kalibrierung aus 0.4.0 automatisch
 
-## Referenz / Autokalibrierung
+## Update von 0.4.0
 
-Beim ersten erfolgreichen Start wird die aktuelle Manometerposition als Referenz gespeichert. Danach sucht die App das gleiche Instrument regelmäßig erneut und folgt dessen neuer Position automatisch.
+Die App erkennt eine alte `calibration.json` ohne 3er-Cluster und lernt die
+Referenz neu. `gauge_template.jpg` wird dabei verworfen. Manuelles Löschen ist
+nicht erforderlich.
 
-Wenn die Kamera bewusst dauerhaft neu ausgerichtet wurde, einmal `rebaseline_on_start: true` setzen und die App starten. Danach die Option wieder auf `false` stellen, damit die neue Referenz erhalten bleibt.
+Nach dem Start erscheinen nacheinander Meldungen wie:
 
-## Dateien im App-Konfigurationsordner
+```text
+3er-Cluster Kandidat bestätigt 1/3
+3er-Cluster Kandidat bestätigt 2/3
+3er-Referenz angelegt: T1/T2/Manometer, M=(...)
+```
 
-- `calibration.json` – gespeicherte Referenz und letzte Position
-- `gauge_template.jpg` – visuelle Vorlage für die Nachführung
-- `debug/latest_frame.jpg` – Vollbild mit erkannter Position
+Erst nach der dritten übereinstimmenden Erkennung wird ein Druckwert
+veröffentlicht. Bis dahin bleibt der Drucksensor `unavailable`.
+
+## Cluster-Geometrie
+
+Der Standard erwartet diese feste Anordnung (unabhängig von absoluter Position,
+Größe und moderater Drehung): T1 und T2 nebeneinander, das Manometer unter T2.
+
+Wichtige Optionen:
+
+- `cluster_confirmations: 3` – Anzahl übereinstimmender Bilder beim Einlernen
+- `cluster_vertical_ratio: 0.80` – Abstand T2→M relativ zu T1→T2
+- `cluster_tolerance: 0.42` – geometrische Toleranz relativ zum T1/T2-Abstand
+- `cluster_prior_radius_px: 400` – großzügige Nähe zur bisherigen manuellen
+  Manometerposition; `0` deaktiviert diesen Zusatz
+- `cluster_confirmation_px: 18` – maximale Positionsabweichung zwischen
+  Bestätigungsbildern
+
+Die vorhandenen `roi_*`, `center_*` und `radius` Werte dienen beim erstmaligen
+Suchen nur noch als grobe Positionshilfe. Die tatsächliche ROI stammt aus dem
+gefundenen Cluster.
+
+## Debug-Dateien
+
+Im App-Konfigurationsordner unter `/addon_configs/..._manometer_reader/`:
+
+- `calibration.json` – Referenz und letzte Position aller drei Instrumente
+- `gauge_template.jpg` – Vorlage des korrekt gewählten Manometers
+- `debug/latest_frame.jpg` – alle Kandidaten (grau), T1/T2 (orange) und
+  Manometer (grün)
 - `debug/latest_roi.jpg` – vergrößerter Manometerausschnitt mit erkanntem Zeiger
 
-Auf HAOS liegen diese Dateien im jeweiligen App-Ordner unter `/addon_configs/..._manometer_reader/`.
+## MQTT-Diagnose
 
-## Wichtige Optionen
+Zusätzlich zu den bisherigen Entitäten werden `3er-Cluster Qualität` und
+`Kamera Drehung` veröffentlicht. Mögliche Statuswerte sind unter anderem
+`cluster_wird_bestaetigt`, `cluster_nicht_gefunden`, `ok`,
+`kamera_verschoben_nachgefuehrt` und `zeiger_unsicher`.
 
-- `interval_sec: 60` – Messintervall; für Heizungsdruck reichen 30–60 s normalerweise aus
-- `auto_locate_interval_sec: 600` – vollständige Positionsprüfung alle 10 Minuten
-- `auto_locate_after_invalid: 2` – bei zwei unsicheren Zeigermessungen sofort neu lokalisieren
-- `movement_warning_px: 18` – ab dieser Positionsabweichung wird `Kamera verschoben` aktiv
-- `template_match_min: 0.55` – Mindestähnlichkeit zur gespeicherten Vorlage
-- `rebaseline_on_start: false` – nur einmal auf true setzen, wenn eine neue Kameraposition als normal akzeptiert werden soll
-
-## MQTT-Entities
-
-- Heizungsdruck
-- Manometer erkannt
-- Kamera verschoben
-- Messung gültig
-- Erkennungsqualität
-- Manometer X / Y / Radius
-- Kamera Verschiebung
-- Manometer Status
-
+Wenn die Kamera absichtlich neu ausgerichtet wurde, `rebaseline_on_start: true`
+für genau einen Start setzen und danach wieder auf `false` zurückstellen.

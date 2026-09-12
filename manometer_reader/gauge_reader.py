@@ -104,7 +104,24 @@ def load_calibration():
     return None
 
 
-def save_calibration(baseline, current):
+def cluster_to_json(cluster):
+    return {
+        name: {"cx": round(float(cluster[name]["cx"]), 3),
+               "cy": round(float(cluster[name]["cy"]), 3),
+               "r": round(float(cluster[name]["r"]), 3)}
+        for name in ("t1", "t2", "gauge")
+    }
+
+
+def cluster_angle(cluster):
+    """Screen angle of the T1->T2 reference axis (positive clockwise)."""
+    return math.degrees(math.atan2(
+        cluster["t2"]["cy"] - cluster["t1"]["cy"],
+        cluster["t2"]["cx"] - cluster["t1"]["cx"],
+    ))
+
+
+def save_calibration(baseline, current, baseline_cluster, current_cluster):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     data = {
         "baseline_cx": round(float(baseline["cx"]), 3),
@@ -113,6 +130,11 @@ def save_calibration(baseline, current):
         "current_cx": round(float(current["cx"]), 3),
         "current_cy": round(float(current["cy"]), 3),
         "current_r": round(float(current["r"]), 3),
+        "calibration_version": 2,
+        "baseline_cluster": cluster_to_json(baseline_cluster),
+        "current_cluster": cluster_to_json(current_cluster),
+        "baseline_rotation_deg": round(cluster_angle(baseline_cluster), 3),
+        "current_rotation_deg": round(cluster_angle(current_cluster), 3),
         "updated": iso_now(),
     }
     tmp = CALIBRATION_FILE.with_suffix(".tmp")
@@ -143,12 +165,12 @@ def circle_edge_score(gray, cx, cy, r):
     return float(np.mean(vals)) if vals else 0.0
 
 
-def hough_in_region(frame, x1, y1, x2, y2, min_r, max_r, expected=None):
+def hough_candidates(frame, x1, y1, x2, y2, min_r, max_r):
     h, w = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     if x2 - x1 < 30 or y2 - y1 < 30:
-        return None
+        return []
 
     crop = frame[y1:y2, x1:x2]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -165,27 +187,34 @@ def hough_in_region(frame, x1, y1, x2, y2, min_r, max_r, expected=None):
         maxRadius=max(int(min_r) + 2, int(max_r)),
     )
     if circles is None:
-        return None
+        return []
 
-    best = None
+    found = []
     for c in np.round(circles[0]).astype(int):
         cx, cy, r = int(c[0]), int(c[1]), int(c[2])
         edge = circle_edge_score(gray, cx, cy, r)
-        score = edge
-        if expected is not None:
-            ex = float(expected["cx"]) - x1
-            ey = float(expected["cy"]) - y1
-            er = max(float(expected["r"]), 1.0)
-            dist = math.hypot(cx - ex, cy - ey) / max(er * 5.0, 1.0)
-            rdiff = abs(r - er) / er
-            score += max(0.0, 0.55 - 0.30 * dist - 0.25 * rdiff)
         candidate = {
             "cx": float(cx + x1),
             "cy": float(cy + y1),
             "r": float(r),
             "source": "circle",
-            "score": float(score),
+            "score": float(edge),
         }
+        found.append(candidate)
+    return found
+
+
+def hough_in_region(frame, x1, y1, x2, y2, min_r, max_r, expected=None):
+    candidates = hough_candidates(frame, x1, y1, x2, y2, min_r, max_r)
+    best = None
+    for candidate in candidates:
+        score = candidate["score"]
+        if expected is not None:
+            er = max(float(expected["r"]), 1.0)
+            dist = math.hypot(candidate["cx"] - float(expected["cx"]), candidate["cy"] - float(expected["cy"])) / max(er * 5.0, 1.0)
+            rdiff = abs(candidate["r"] - er) / er
+            score += max(0.0, 0.55 - 0.30 * dist - 0.25 * rdiff)
+        candidate = dict(candidate, score=float(score))
         if best is None or candidate["score"] > best["score"]:
             best = candidate
     return best
@@ -228,6 +257,95 @@ def locate_by_circle(frame, expected, opt):
     found["r"] /= scale
     found["source"] = "circle_global"
     return found
+
+
+def detect_cluster(frame, opt, expected_gauge=None, reference_cluster=None):
+    """Find the installation-specific T1--T2 / gauge triangle.
+
+    Geometry is evaluated in normalized coordinates, so translation, moderate
+    zoom and camera rotation are tolerated.  The gauge is the third circle on
+    the clockwise side of the T1->T2 axis.
+    """
+    fh, fw = frame.shape[:2]
+    scale = min(1.0, 1024.0 / float(fw))
+    small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    min_r = max(5, int(float(opt.get("auto_min_radius", 14)) * scale))
+    max_r = max(min_r + 2, int(float(opt.get("auto_max_radius", 80)) * scale))
+    raw = hough_candidates(small, 0, 0, small.shape[1], small.shape[0], min_r, max_r)
+    candidates = []
+    for c in raw:
+        candidates.append({
+            "cx": c["cx"] / scale, "cy": c["cy"] / scale,
+            "r": c["r"] / scale, "score": c["score"], "source": "cluster_circle",
+        })
+
+    vertical_ratio = float(opt.get("cluster_vertical_ratio", 0.80))
+    tolerance = max(0.10, float(opt.get("cluster_tolerance", 0.42)))
+    min_spacing_r = float(opt.get("cluster_min_spacing_r", 2.2))
+    max_spacing_r = float(opt.get("cluster_max_spacing_r", 8.0))
+    prior_radius = float(opt.get("cluster_prior_radius_px", 400))
+    best = None
+    for i, t1 in enumerate(candidates):
+        for j, t2 in enumerate(candidates):
+            if i == j:
+                continue
+            vx, vy = t2["cx"] - t1["cx"], t2["cy"] - t1["cy"]
+            spacing = math.hypot(vx, vy)
+            mean_r = max(1.0, (t1["r"] + t2["r"]) / 2.0)
+            if not min_spacing_r * mean_r <= spacing <= max_spacing_r * mean_r:
+                continue
+            if abs(t1["r"] - t2["r"]) / mean_r > 0.45:
+                continue
+
+            # In image coordinates (+y down), (-vy, vx) is clockwise 90 degrees.
+            predicted_x = t2["cx"] - vertical_ratio * vy
+            predicted_y = t2["cy"] + vertical_ratio * vx
+            for k, gauge in enumerate(candidates):
+                if k in (i, j):
+                    continue
+                residual = math.hypot(gauge["cx"] - predicted_x, gauge["cy"] - predicted_y) / spacing
+                if residual > tolerance:
+                    continue
+                radius_error = abs(gauge["r"] - mean_r) / mean_r
+                if radius_error > 0.60:
+                    continue
+                edge = (t1["score"] + t2["score"] + gauge["score"]) / 3.0
+                geometry = max(0.0, 1.0 - residual / tolerance)
+                radius_score = max(0.0, 1.0 - radius_error / 0.60)
+                score = 0.60 * geometry + 0.20 * radius_score + 0.20 * min(1.0, edge * 2.0)
+
+                # Broad installation prior prevents an unrelated triangle on first boot.
+                if expected_gauge is not None and prior_radius > 0:
+                    dprior = math.hypot(gauge["cx"] - expected_gauge["cx"], gauge["cy"] - expected_gauge["cy"])
+                    score += 0.18 * max(0.0, 1.0 - dprior / prior_radius)
+
+                # Once learned, compare all three points after a similarity transform.
+                if reference_cluster is not None:
+                    ref_spacing = math.hypot(
+                        reference_cluster["t2"]["cx"] - reference_cluster["t1"]["cx"],
+                        reference_cluster["t2"]["cy"] - reference_cluster["t1"]["cy"],
+                    )
+                    ref_ratio = math.hypot(
+                        reference_cluster["gauge"]["cx"] - reference_cluster["t2"]["cx"],
+                        reference_cluster["gauge"]["cy"] - reference_cluster["t2"]["cy"],
+                    ) / max(ref_spacing, 1.0)
+                    observed_ratio = math.hypot(gauge["cx"] - t2["cx"], gauge["cy"] - t2["cy"]) / spacing
+                    score += 0.20 * max(0.0, 1.0 - abs(observed_ratio - ref_ratio) / tolerance)
+
+                cluster = {"t1": t1, "t2": t2, "gauge": gauge, "score": float(score)}
+                if best is None or score > best["score"]:
+                    best = cluster
+    return best, candidates
+
+
+def clusters_similar(a, b, opt):
+    if a is None or b is None:
+        return False
+    gauge_tol = float(opt.get("cluster_confirmation_px", 18))
+    angle_tol = float(opt.get("cluster_confirmation_angle_deg", 8.0))
+    pos_ok = math.hypot(a["gauge"]["cx"] - b["gauge"]["cx"], a["gauge"]["cy"] - b["gauge"]["cy"]) <= gauge_tol
+    da = (cluster_angle(a) - cluster_angle(b) + 180.0) % 360.0 - 180.0
+    return pos_ok and abs(da) <= angle_tol
 
 
 def locate_by_template(frame, baseline, min_score):
@@ -300,9 +418,9 @@ def counterclockwise_distance(start_deg, end_deg):
     return (end_deg - start_deg) % 360.0
 
 
-def detect_needle(roi, center_x, center_y, radius, opt):
-    angle_min_deg = float(opt["angle_min_deg"])
-    angle_max_deg = float(opt["angle_max_deg"])
+def detect_needle(roi, center_x, center_y, radius, opt, angle_offset_deg=0.0):
+    angle_min_deg = float(opt["angle_min_deg"]) + angle_offset_deg
+    angle_max_deg = float(opt["angle_max_deg"]) + angle_offset_deg
     scale_min = float(opt["scale_min"])
     scale_max = float(opt["scale_max"])
     clockwise = bool(opt["clockwise"])
@@ -392,12 +510,29 @@ def detect_needle(roi, center_x, center_y, radius, opt):
         "angle_deg": float(angle),
         "confidence": float(confidence),
         "score": float(smooth[best_idx]),
+        "angle_offset_deg": float(angle_offset_deg),
     }
 
 
-def save_debug(frame, geom, baseline, roi, roi_x, roi_y, center_x, center_y, result, filtered, valid, gauge_found, moved, locator_score):
+def save_debug(frame, geom, baseline, roi, roi_x, roi_y, center_x, center_y, result, filtered, valid, gauge_found, moved, locator_score, cluster=None, candidates=None, confirmations=0):
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     overview = frame.copy()
+    for n, candidate in enumerate(candidates or []):
+        cc = (int(round(candidate["cx"])), int(round(candidate["cy"])))
+        cv2.circle(overview, cc, int(round(candidate["r"])), (80, 80, 80), 1)
+        cv2.putText(overview, str(n + 1), (cc[0] + 3, cc[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120,120,120), 1, cv2.LINE_AA)
+    if cluster is not None:
+        colors = {"t1": (255, 180, 0), "t2": (255, 180, 0), "gauge": (0, 255, 0)}
+        for name in ("t1", "t2", "gauge"):
+            item = cluster[name]
+            p = (int(round(item["cx"])), int(round(item["cy"])))
+            cv2.circle(overview, p, int(round(item["r"])), colors[name], 3)
+            cv2.putText(overview, name.upper(), (p[0] + 5, p[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, colors[name], 2, cv2.LINE_AA)
+        p1 = (int(round(cluster["t1"]["cx"])), int(round(cluster["t1"]["cy"])))
+        p2 = (int(round(cluster["t2"]["cx"])), int(round(cluster["t2"]["cy"])))
+        pg = (int(round(cluster["gauge"]["cx"])), int(round(cluster["gauge"]["cy"])))
+        cv2.line(overview, p1, p2, (255, 180, 0), 2)
+        cv2.line(overview, p2, pg, (0, 255, 0), 2)
     cx, cy, r = int(round(geom["cx"])), int(round(geom["cy"])), int(round(geom["r"]))
     cv2.circle(overview, (cx, cy), r, (255, 255, 255), 2)
     cv2.circle(overview, (cx, cy), 3, (0, 255, 255), -1)
@@ -405,7 +540,7 @@ def save_debug(frame, geom, baseline, roi, roi_x, roi_y, center_x, center_y, res
         bcx, bcy, br = int(round(baseline["cx"])), int(round(baseline["cy"])), int(round(baseline["r"]))
         cv2.circle(overview, (bcx, bcy), br, (180, 180, 180), 1)
     cv2.rectangle(overview, (roi_x, roi_y), (roi_x + roi.shape[1], roi_y + roi.shape[0]), (255, 255, 255), 1)
-    cv2.putText(overview, f"found={gauge_found} moved={moved} source={geom.get('source','?')} loc={locator_score:.2f}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(overview, f"cluster={gauge_found} confirm={confirmations} moved={moved} score={locator_score:.2f}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
     cv2.imwrite(str(DEBUG_DIR / "latest_frame.jpg"), overview)
 
     annotated = roi.copy()
@@ -453,7 +588,7 @@ def publish_discovery(client, opt):
         "identifiers": ["manometer_heizung"],
         "name": "Heizungsmanometer",
         "manufacturer": "Custom",
-        "model": "RTSP/OpenCV Gauge Reader 0.4",
+        "model": "RTSP/OpenCV Gauge Reader 0.4.1 Cluster",
     }
 
     entities = []
@@ -487,6 +622,8 @@ def publish_discovery(client, opt):
         ("manometer_heizung_position_y", "Manometer Y", "{{ value_json.gauge_y }}", "px"),
         ("manometer_heizung_radius", "Manometer Radius", "{{ value_json.gauge_radius }}", "px"),
         ("manometer_heizung_verschiebung", "Kamera Verschiebung", "{{ value_json.movement_px }}", "px"),
+        ("manometer_heizung_cluster_score", "3er-Cluster Qualität", "{{ value_json.cluster_score }}", None),
+        ("manometer_heizung_rotation", "Kamera Drehung", "{{ value_json.camera_rotation_deg }}", "°"),
     ]:
         cfg = {"name": name, "unique_id": oid, "state_topic": state_topic, "value_template": template, "availability_topic": avail_topic, "device": device}
         if unit:
@@ -521,12 +658,19 @@ def main():
 
     cal = load_calibration()
     manual = manual_geometry(opt)
-    if cal:
+    if cal and int(cal.get("calibration_version", 0)) >= 2 and cal.get("baseline_cluster"):
         baseline = {"cx": float(cal["baseline_cx"]), "cy": float(cal["baseline_cy"]), "r": float(cal["baseline_r"]), "source": "baseline", "score": 1.0}
         current = {"cx": float(cal.get("current_cx", cal["baseline_cx"])), "cy": float(cal.get("current_cy", cal["baseline_cy"])), "r": float(cal.get("current_r", cal["baseline_r"])), "source": "saved", "score": 1.0}
+        baseline_cluster = cal["baseline_cluster"]
+        current_cluster = cal.get("current_cluster", baseline_cluster)
     else:
+        if cal:
+            log("Alte Einzelkreis-Kalibrierung erkannt und ignoriert; das 3er-Cluster wird neu gelernt.")
+            TEMPLATE_FILE.unlink(missing_ok=True)
         baseline = None
         current = manual.copy()
+        baseline_cluster = None
+        current_cluster = None
 
     interval = int(opt.get("interval_sec", 60))
     capture_timeout = int(opt.get("capture_timeout_sec", 12))
@@ -536,6 +680,7 @@ def main():
     median_window = max(1, int(opt.get("median_window", 5)))
     confidence_min = float(opt.get("confidence_min", 1.0))
     failures_limit = max(1, int(opt.get("failures_until_unavailable", 3)))
+    confirmations_required = max(1, int(opt.get("cluster_confirmations", 3)))
     history = deque(maxlen=median_window)
 
     client = mqtt_client_from_options(opt)
@@ -549,6 +694,9 @@ def main():
     invalid_count = 0
     last_locate = 0.0
     gauge_found = baseline is not None
+    pending_cluster = None
+    confirmation_count = 0
+    last_candidates = []
 
     log("MQTT verbunden und Discovery veröffentlicht.")
     log("Starte Messschleife (CPU-schonend, Standardintervall 60 s).")
@@ -566,25 +714,46 @@ def main():
 
             locator_score = float(current.get("score", 0.0))
             if should_locate:
-                found = auto_locate(frame, current, baseline, opt)
+                found_cluster, last_candidates = detect_cluster(
+                    frame, opt, expected_gauge=current,
+                    reference_cluster=baseline_cluster,
+                )
                 last_locate = now
-                if found is not None:
-                    current = found
-                    locator_score = float(found.get("score", 0.0))
-                    gauge_found = True
+                if found_cluster is not None:
+                    locator_score = float(found_cluster.get("score", 0.0))
                     if baseline is None:
-                        baseline = current.copy()
-                        create_template(frame, baseline)
-                        log(f"Referenz automatisch angelegt: x={baseline['cx']:.1f}, y={baseline['cy']:.1f}, r={baseline['r']:.1f}")
-                    elif not TEMPLATE_FILE.exists():
-                        create_template(frame, baseline)
-                    save_calibration(baseline, current)
-                    invalid_count = 0
-                    log(f"Manometer lokalisiert: x={current['cx']:.1f}, y={current['cy']:.1f}, r={current['r']:.1f}, Quelle={current['source']}, score={locator_score:.2f}")
+                        if clusters_similar(found_cluster, pending_cluster, opt):
+                            confirmation_count += 1
+                        else:
+                            pending_cluster = found_cluster
+                            confirmation_count = 1
+                        gauge_found = False
+                        log(f"3er-Cluster Kandidat bestätigt {confirmation_count}/{confirmations_required}: score={locator_score:.2f}")
+                        if confirmation_count >= confirmations_required:
+                            baseline_cluster = found_cluster
+                            current_cluster = found_cluster
+                            g = found_cluster["gauge"]
+                            current = {"cx": g["cx"], "cy": g["cy"], "r": g["r"], "source": "cluster", "score": locator_score}
+                            baseline = current.copy()
+                            create_template(frame, baseline)
+                            save_calibration(baseline, current, baseline_cluster, current_cluster)
+                            gauge_found = True
+                            invalid_count = 0
+                            log(f"3er-Referenz angelegt: T1/T2/Manometer, M=({current['cx']:.1f},{current['cy']:.1f},r{current['r']:.1f})")
+                    else:
+                        current_cluster = found_cluster
+                        g = found_cluster["gauge"]
+                        current = {"cx": g["cx"], "cy": g["cy"], "r": g["r"], "source": "cluster", "score": locator_score}
+                        gauge_found = True
+                        invalid_count = 0
+                        save_calibration(baseline, current, baseline_cluster, current_cluster)
+                        log(f"3er-Cluster lokalisiert: M=({current['cx']:.1f},{current['cy']:.1f},r{current['r']:.1f}), score={locator_score:.2f}")
                 else:
                     gauge_found = False
                     invalid_count += 1
-                    log("WARNUNG: Manometer im Kamerabild nicht gefunden.")
+                    confirmation_count = 0
+                    pending_cluster = None
+                    log("WARNUNG: Thermometer-/Manometer-Cluster nicht gefunden.")
 
             moved, movement_px, radius_change_pct = movement_state(current, baseline, opt)
 
@@ -595,14 +764,20 @@ def main():
                     "valid": False, "gauge_found": False, "camera_moved": False,
                     "gauge_x": round(current["cx"], 1), "gauge_y": round(current["cy"], 1), "gauge_radius": round(current["r"], 1),
                     "movement_px": round(movement_px, 1), "radius_change_percent": round(radius_change_pct, 1),
-                    "locator_score": round(locator_score, 3), "status": "manometer_nicht_gefunden", "last_measurement": iso_now(),
+                    "locator_score": round(locator_score, 3),
+                    "cluster_confirmations": confirmation_count,
+                    "status": "cluster_wird_bestaetigt" if confirmation_count else "cluster_nicht_gefunden",
+                    "last_measurement": iso_now(),
                 }
                 client.publish(state_topic, json.dumps(payload), qos=1, retain=True)
                 client.publish(avail_topic, "online", qos=1, retain=True)
                 sleep_for = interval
             else:
                 roi, roi_x, roi_y, rcx, rcy = build_roi_from_geometry(frame, current)
-                result = detect_needle(roi, rcx, rcy, current["r"], opt)
+                rotation_delta = 0.0
+                if baseline_cluster is not None and current_cluster is not None:
+                    rotation_delta = (cluster_angle(current_cluster) - cluster_angle(baseline_cluster) + 180.0) % 360.0 - 180.0
+                result = detect_needle(roi, rcx, rcy, current["r"], opt, angle_offset_deg=-rotation_delta)
                 valid = result["confidence"] >= confidence_min
                 if valid:
                     history.append(float(result["pressure_raw"]))
@@ -630,6 +805,9 @@ def main():
                     "movement_px": round(movement_px, 1),
                     "radius_change_percent": round(radius_change_pct, 1),
                     "locator_score": round(locator_score, 3),
+                    "cluster_score": round(locator_score, 3),
+                    "cluster_confirmations": confirmations_required,
+                    "camera_rotation_deg": round(rotation_delta, 2),
                     "status": status,
                     "last_measurement": iso_now(),
                 }
@@ -637,7 +815,7 @@ def main():
                 client.publish(avail_topic, "online", qos=1, retain=True)
 
                 if bool(opt.get("debug", True)):
-                    save_debug(frame, current, baseline, roi, roi_x, roi_y, rcx, rcy, result, filtered, valid, gauge_found, moved, locator_score)
+                    save_debug(frame, current, baseline, roi, roi_x, roi_y, rcx, rcy, result, filtered, valid, gauge_found, moved, locator_score, current_cluster, last_candidates, confirmation_count)
 
                 log(
                     f"raw={result['pressure_raw']:.2f} bar | median={filtered:.2f} bar | "
