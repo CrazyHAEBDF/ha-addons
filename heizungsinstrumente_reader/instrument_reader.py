@@ -536,6 +536,87 @@ def detect_needle(roi, center_x, center_y, radius, opt, angle_offset_deg=0.0):
     }
 
 
+def angle_to_value(angle, opt):
+    start = float(opt["angle_min_deg"])
+    end = float(opt["angle_max_deg"])
+    clockwise = bool(opt["clockwise"])
+    sweep = clockwise_distance(start, end) if clockwise else counterclockwise_distance(start, end)
+    delta = clockwise_distance(start, angle) if clockwise else counterclockwise_distance(start, angle)
+    if delta > sweep:
+        return None
+    return float(opt["scale_min"]) + delta / sweep * (float(opt["scale_max"]) - float(opt["scale_min"]))
+
+
+def detect_origin_line_needle(roi, center_x, center_y, radius, opt, angle_offset_deg=0.0):
+    """Detect a real pointer segment that starts at the spindle.
+
+    Text and scale marks may be dark but do not form a sufficiently long line
+    through the known spindle. This is therefore the primary thermometer
+    detector; the radial darkness scan remains available as fallback.
+    """
+    scale = max(3, int(opt.get("processing_scale", 4)))
+    proc = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0.7)
+    edges = cv2.Canny(gray, 35, 105)
+    cx, cy, rad = center_x * scale, center_y * scale, radius * scale
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 360.0,
+        threshold=max(8, int(rad * 0.16)),
+        minLineLength=max(8, int(rad * 0.30)),
+        maxLineGap=max(3, int(rad * 0.16)),
+    )
+    if lines is None:
+        return None
+
+    candidates = []
+    start = float(opt["angle_min_deg"]) + angle_offset_deg
+    end = float(opt["angle_max_deg"]) + angle_offset_deg
+    mapped_opt = dict(opt, angle_min_deg=start, angle_max_deg=end)
+    for x1, y1, x2, y2 in lines[:, 0]:
+        dx, dy = float(x2 - x1), float(y2 - y1)
+        length = math.hypot(dx, dy)
+        if length < rad * 0.30:
+            continue
+        # Perpendicular distance from spindle to the infinite detected line.
+        line_distance = abs(dy * cx - dx * cy + x2 * y1 - y2 * x1) / max(length, 1.0)
+        if line_distance > rad * 0.20:
+            continue
+        for ex, ey in ((float(x1), float(y1)), (float(x2), float(y2))):
+            pointer_length = math.hypot(ex - cx, ey - cy)
+            if pointer_length < rad * 0.48 or pointer_length > rad * 1.18:
+                continue
+            angle = math.degrees(math.atan2(-(ey - cy), ex - cx)) % 360.0
+            value = angle_to_value(angle, mapped_opt)
+            if value is None:
+                continue
+            origin_score = max(0.0, 1.0 - line_distance / max(rad * 0.20, 1.0))
+            length_score = min(1.0, pointer_length / max(rad * 0.90, 1.0))
+            segment_score = min(1.0, length / max(rad * 0.80, 1.0))
+            score = 0.50 * origin_score + 0.32 * length_score + 0.18 * segment_score
+            candidates.append((score, angle, value, pointer_length))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    best = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else 0.0
+    confidence = 1.0 + 3.0 * max(0.0, best[0] - second_score) + 0.8 * best[0]
+    return {
+        "pressure_raw": float(best[2]), "angle_deg": float(best[1]),
+        "confidence": float(confidence), "score": float(best[0]),
+        "angle_offset_deg": float(angle_offset_deg), "method": "origin_line",
+    }
+
+
+def detect_thermometer_needle(roi, center_x, center_y, radius, opt, angle_offset_deg=0.0):
+    line_result = detect_origin_line_needle(roi, center_x, center_y, radius, opt, angle_offset_deg)
+    if line_result is not None and line_result["confidence"] >= 1.15:
+        return line_result
+    fallback = detect_needle(roi, center_x, center_y, radius, opt, angle_offset_deg)
+    fallback["method"] = "radial_fallback"
+    return fallback
+
+
 def save_debug(frame, geom, baseline, roi, roi_x, roi_y, center_x, center_y, result, filtered, valid, gauge_found, moved, locator_score, cluster=None, candidates=None, confirmations=0):
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     overview = frame.copy()
@@ -1028,7 +1109,7 @@ def publish_instrument_discovery(client, opt):
         "identifiers": ["heizung_instrument_reader"],
         "name": "Heizungsinstrumente",
         "manufacturer": "Custom",
-        "model": "RTSP/OpenCV Instrument Reader 1.0.2",
+        "model": "RTSP/OpenCV Instrument Reader 1.0.3",
     }
     entities = []
     for key, oid, name in (
@@ -1241,7 +1322,7 @@ def instrument_main():
                     roi,x1,y1,cx,cy = build_roi_from_geometry(frame, item)
                     cx += float(opt.get("thermometer_needle_center_x_ratio",0.0))*item["r"]
                     cy += float(opt.get("thermometer_needle_center_y_ratio",-0.55))*item["r"]
-                    result = detect_needle(roi,cx,cy,item["r"],thermometer_options(opt),angle_offset_deg=-rotation)
+                    result = detect_thermometer_needle(roi,cx,cy,item["r"],thermometer_options(opt),angle_offset_deg=-rotation)
                     confidence_ok = result["confidence"] >= thermometer_confidence_min
                     value, valid, reason = stabilize_measurement(
                         stability[key], result["pressure_raw"], confidence_ok,
@@ -1278,6 +1359,7 @@ def instrument_main():
                     "return_temperature": round(results["return"][0],2), "supply_temperature": round(results["supply"][0],2), "pressure": round(results["pressure"][0],3),
                     "return_raw": round(results["return"][1]["pressure_raw"],2), "supply_raw": round(results["supply"][1]["pressure_raw"],2),
                     "pressure_raw": round(results["pressure"][1]["pressure_raw"],3),
+                    "return_method": results["return"][1].get("method","radial"), "supply_method": results["supply"][1].get("method","radial"),
                     "return_filter": results["return_reason"], "supply_filter": results["supply_reason"], "pressure_filter": results["pressure_reason"],
                     "return_valid": results["return"][2], "supply_valid": results["supply"][2], "pressure_valid": results["pressure"][2], "cluster_found": True,
                     "return_confidence": round(results["return"][1]["confidence"],3), "supply_confidence": round(results["supply"][1]["confidence"],3), "pressure_confidence": round(results["pressure"][1]["confidence"],3),
@@ -1299,8 +1381,8 @@ def instrument_main():
                     client.publish(f"{base}/debug/pressure",pb,qos=0,retain=True)
                 log(
                     f"Druck raw={results['pressure'][1]['pressure_raw']:.2f} -> {results['pressure'][0]:.2f} bar ({results['pressure_reason']}) | "
-                    f"Rücklauf raw={results['return'][1]['pressure_raw']:.1f} -> {results['return'][0]:.1f} °C ({results['return_reason']}) | "
-                    f"Zulauf raw={results['supply'][1]['pressure_raw']:.1f} -> {results['supply'][0]:.1f} °C ({results['supply_reason']})"
+                    f"Rücklauf raw={results['return'][1]['pressure_raw']:.1f} -> {results['return'][0]:.1f} °C ({results['return'][1].get('method','radial')}, {results['return_reason']}) | "
+                    f"Zulauf raw={results['supply'][1]['pressure_raw']:.1f} -> {results['supply'][0]:.1f} °C ({results['supply'][1].get('method','radial')}, {results['supply_reason']})"
                 )
             sleep_for = interval
         except Exception as exc:

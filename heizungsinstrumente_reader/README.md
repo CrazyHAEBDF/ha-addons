@@ -1,4 +1,12 @@
-# Heizungs Instrument Reader 1.0.2
+# Heizungs Instrument Reader 1.0.3
+
+## Optimierung in 1.0.3
+
+- erkennt Thermometerzeiger primär als lange Linie durch den bekannten
+  Drehpunkt, statt dunkle Ziffern und Skalenstriche aufsummieren zu lassen
+- prüft Linienursprung, Länge und zulässigen Skalenwinkel
+- verwendet die bisherige Radialerkennung nur noch als Fallback
+- protokolliert `origin_line` beziehungsweise `radial_fallback` im Messlog
 
 ## Korrektur in 1.0.2
 

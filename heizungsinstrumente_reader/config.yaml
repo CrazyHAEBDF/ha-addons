@@ -1,5 +1,5 @@
 name: "Heizungs Instrument Reader"
-version: "1.0.2"
+version: "1.0.3"
 slug: "instrument_reader"
 description: "Liest Heizungsdruck, Rücklauf- und Zulauftemperatur gemeinsam aus einem RTSP-Bild und veröffentlicht alles per MQTT."
 url: "https://github.com/DEIN_GITHUB_NAME/ha-addons"
