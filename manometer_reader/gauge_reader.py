@@ -130,7 +130,7 @@ def save_calibration(baseline, current, baseline_cluster, current_cluster):
         "current_cx": round(float(current["cx"]), 3),
         "current_cy": round(float(current["cy"]), 3),
         "current_r": round(float(current["r"]), 3),
-        "calibration_version": 2,
+        "calibration_version": 3,
         "baseline_cluster": cluster_to_json(baseline_cluster),
         "current_cluster": cluster_to_json(current_cluster),
         "baseline_rotation_deg": round(cluster_angle(baseline_cluster), 3),
@@ -269,9 +269,18 @@ def detect_cluster(frame, opt, expected_gauge=None, reference_cluster=None):
     fh, fw = frame.shape[:2]
     scale = min(1.0, 1024.0 / float(fw))
     small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    min_r = max(5, int(float(opt.get("auto_min_radius", 14)) * scale))
-    max_r = max(min_r + 2, int(float(opt.get("auto_max_radius", 80)) * scale))
-    raw = hough_candidates(small, 0, 0, small.shape[1], small.shape[0], min_r, max_r)
+    min_r = max(5, int(float(opt.get("cluster_min_radius_px", 14)) * scale))
+    max_r = max(min_r + 2, int(float(opt.get("cluster_max_radius_px", 38)) * scale))
+    zone_x1 = min(0.95, max(0.0, float(opt.get("cluster_zone_x_min", 0.40))))
+    zone_x2 = min(1.0, max(zone_x1 + 0.05, float(opt.get("cluster_zone_x_max", 0.68))))
+    zone_y1 = min(0.95, max(0.0, float(opt.get("cluster_zone_y_min", 0.22))))
+    zone_y2 = min(1.0, max(zone_y1 + 0.05, float(opt.get("cluster_zone_y_max", 0.60))))
+    raw = hough_candidates(
+        small,
+        int(small.shape[1] * zone_x1), int(small.shape[0] * zone_y1),
+        int(small.shape[1] * zone_x2), int(small.shape[0] * zone_y2),
+        min_r, max_r,
+    )
     candidates = []
     for c in raw:
         candidates.append({
@@ -279,8 +288,9 @@ def detect_cluster(frame, opt, expected_gauge=None, reference_cluster=None):
             "r": c["r"] / scale, "score": c["score"], "source": "cluster_circle",
         })
 
-    vertical_ratio = float(opt.get("cluster_vertical_ratio", 0.80))
-    tolerance = max(0.10, float(opt.get("cluster_tolerance", 0.42)))
+    offset_x_ratio = float(opt.get("cluster_gauge_offset_x_ratio", 0.73))
+    offset_y_ratio = float(opt.get("cluster_gauge_offset_y_ratio", 1.61))
+    tolerance = max(0.10, float(opt.get("cluster_tolerance", 0.32)))
     min_spacing_r = float(opt.get("cluster_min_spacing_r", 2.2))
     max_spacing_r = float(opt.get("cluster_max_spacing_r", 8.0))
     prior_radius = float(opt.get("cluster_prior_radius_px", 400))
@@ -297,9 +307,9 @@ def detect_cluster(frame, opt, expected_gauge=None, reference_cluster=None):
             if abs(t1["r"] - t2["r"]) / mean_r > 0.45:
                 continue
 
-            # In image coordinates (+y down), (-vy, vx) is clockwise 90 degrees.
-            predicted_x = t2["cx"] - vertical_ratio * vy
-            predicted_y = t2["cy"] + vertical_ratio * vx
+            # Installation geometry in the rotating/scaling T1->T2 basis.
+            predicted_x = t2["cx"] + offset_x_ratio * vx - offset_y_ratio * vy
+            predicted_y = t2["cy"] + offset_x_ratio * vy + offset_y_ratio * vx
             for k, gauge in enumerate(candidates):
                 if k in (i, j):
                     continue
@@ -541,7 +551,11 @@ def save_debug(frame, geom, baseline, roi, roi_x, roi_y, center_x, center_y, res
         cv2.circle(overview, (bcx, bcy), br, (180, 180, 180), 1)
     cv2.rectangle(overview, (roi_x, roi_y), (roi_x + roi.shape[1], roi_y + roi.shape[0]), (255, 255, 255), 1)
     cv2.putText(overview, f"cluster={gauge_found} confirm={confirmations} moved={moved} score={locator_score:.2f}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
-    cv2.imwrite(str(DEBUG_DIR / "latest_frame.jpg"), overview)
+    ok, overview_buffer = cv2.imencode(".jpg", overview, [cv2.IMWRITE_JPEG_QUALITY, 78])
+    if not ok:
+        raise RuntimeError("Debug-Vollbild konnte nicht als JPEG kodiert werden")
+    overview_bytes = overview_buffer.tobytes()
+    (DEBUG_DIR / "latest_frame.jpg").write_bytes(overview_bytes)
 
     annotated = roi.copy()
     rcx, rcy = int(round(center_x)), int(round(center_y))
@@ -554,7 +568,47 @@ def save_debug(frame, geom, baseline, roi, roi_x, roi_y, center_x, center_y, res
     cv2.putText(annotated, f"raw {result['pressure_raw']:.2f} med {filtered:.2f}", (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255,255,255), 1, cv2.LINE_AA)
     cv2.putText(annotated, f"conf {result['confidence']:.2f} valid {valid}", (2, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255,255,255), 1, cv2.LINE_AA)
     zoom = cv2.resize(annotated, None, fx=7, fy=7, interpolation=cv2.INTER_NEAREST)
-    cv2.imwrite(str(DEBUG_DIR / "latest_roi.jpg"), zoom)
+    ok, roi_buffer = cv2.imencode(".jpg", zoom, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        raise RuntimeError("Debug-ROI konnte nicht als JPEG kodiert werden")
+    roi_bytes = roi_buffer.tobytes()
+    (DEBUG_DIR / "latest_roi.jpg").write_bytes(roi_bytes)
+    return overview_bytes, roi_bytes
+
+
+def save_pending_debug(frame, opt, cluster, candidates, confirmations, score):
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    overview = frame.copy()
+    h, w = overview.shape[:2]
+    x1 = int(w * float(opt.get("cluster_zone_x_min", 0.40)))
+    x2 = int(w * float(opt.get("cluster_zone_x_max", 0.68)))
+    y1 = int(h * float(opt.get("cluster_zone_y_min", 0.22)))
+    y2 = int(h * float(opt.get("cluster_zone_y_max", 0.60)))
+    cv2.rectangle(overview, (x1, y1), (x2, y2), (180, 120, 0), 2)
+    for candidate in candidates or []:
+        p = (int(round(candidate["cx"])), int(round(candidate["cy"])))
+        cv2.circle(overview, p, int(round(candidate["r"])), (90, 90, 90), 1)
+    if cluster is not None:
+        for name, color in (("t1", (255, 180, 0)), ("t2", (255, 180, 0)), ("gauge", (0, 255, 0))):
+            item = cluster[name]
+            p = (int(round(item["cx"])), int(round(item["cy"])))
+            cv2.circle(overview, p, int(round(item["r"])), color, 3)
+            cv2.putText(overview, name.upper(), (p[0] + 5, p[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    required = int(opt.get("cluster_confirmations", 3))
+    cv2.putText(overview, f"Kalibrierung {confirmations}/{required} score={score:.2f}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255,255,255), 2, cv2.LINE_AA)
+    ok, buffer = cv2.imencode(".jpg", overview, [cv2.IMWRITE_JPEG_QUALITY, 78])
+    if not ok:
+        raise RuntimeError("Kalibrierungsbild konnte nicht als JPEG kodiert werden")
+    image_bytes = buffer.tobytes()
+    (DEBUG_DIR / "latest_frame.jpg").write_bytes(image_bytes)
+    return image_bytes
+
+
+def publish_debug_images(client, base, overview_bytes=None, roi_bytes=None):
+    if overview_bytes:
+        client.publish(f"{base}/debug/frame", overview_bytes, qos=0, retain=True)
+    if roi_bytes:
+        client.publish(f"{base}/debug/roi", roi_bytes, qos=0, retain=True)
 
 
 def mqtt_client_from_options(opt):
@@ -588,7 +642,7 @@ def publish_discovery(client, opt):
         "identifiers": ["manometer_heizung"],
         "name": "Heizungsmanometer",
         "manufacturer": "Custom",
-        "model": "RTSP/OpenCV Gauge Reader 0.4.1 Cluster",
+        "model": "RTSP/OpenCV Gauge Reader 0.4.2 Cluster",
     }
 
     entities = []
@@ -634,6 +688,15 @@ def publish_discovery(client, opt):
         "state_topic": state_topic, "value_template": "{{ value_json.status }}",
         "availability_topic": avail_topic, "device": device,
     }))
+    for oid, name, topic in (
+        ("manometer_heizung_debug_vollbild", "Debug Vollbild", f"{base}/debug/frame"),
+        ("manometer_heizung_debug_roi", "Debug Manometer", f"{base}/debug/roi"),
+    ):
+        entities.append(discovery_sensor(discovery, "camera", oid, {
+            "name": name, "unique_id": oid, "topic": topic,
+            "default_entity_id": f"camera.{oid}",
+            "availability_topic": avail_topic, "device": device,
+        }))
 
     for topic, payload in entities:
         client.publish(topic, payload, qos=1, retain=True)
@@ -658,7 +721,7 @@ def main():
 
     cal = load_calibration()
     manual = manual_geometry(opt)
-    if cal and int(cal.get("calibration_version", 0)) >= 2 and cal.get("baseline_cluster"):
+    if cal and int(cal.get("calibration_version", 0)) >= 3 and cal.get("baseline_cluster"):
         baseline = {"cx": float(cal["baseline_cx"]), "cy": float(cal["baseline_cy"]), "r": float(cal["baseline_r"]), "source": "baseline", "score": 1.0}
         current = {"cx": float(cal.get("current_cx", cal["baseline_cx"])), "cy": float(cal.get("current_cy", cal["baseline_cy"])), "r": float(cal.get("current_r", cal["baseline_r"])), "source": "saved", "score": 1.0}
         baseline_cluster = cal["baseline_cluster"]
@@ -713,6 +776,7 @@ def main():
             )
 
             locator_score = float(current.get("score", 0.0))
+            debug_cluster = current_cluster
             if should_locate:
                 found_cluster, last_candidates = detect_cluster(
                     frame, opt, expected_gauge=current,
@@ -720,7 +784,14 @@ def main():
                 )
                 last_locate = now
                 if found_cluster is not None:
+                    debug_cluster = found_cluster
                     locator_score = float(found_cluster.get("score", 0.0))
+                    t1, t2, gm = found_cluster["t1"], found_cluster["t2"], found_cluster["gauge"]
+                    log(
+                        f"Cluster-Koordinaten: T1=({t1['cx']:.0f},{t1['cy']:.0f},r{t1['r']:.0f}) "
+                        f"T2=({t2['cx']:.0f},{t2['cy']:.0f},r{t2['r']:.0f}) "
+                        f"M=({gm['cx']:.0f},{gm['cy']:.0f},r{gm['r']:.0f})"
+                    )
                     if baseline is None:
                         if clusters_similar(found_cluster, pending_cluster, opt):
                             confirmation_count += 1
@@ -758,6 +829,12 @@ def main():
             moved, movement_px, radius_change_pct = movement_state(current, baseline, opt)
 
             if not gauge_found:
+                if bool(opt.get("debug", True)):
+                    pending_bytes = save_pending_debug(
+                        frame, opt, debug_cluster, last_candidates,
+                        confirmation_count, locator_score,
+                    )
+                    publish_debug_images(client, base, overview_bytes=pending_bytes)
                 client.publish(pressure_avail, "offline", qos=1, retain=True)
                 payload = {
                     "pressure": None, "raw_pressure": None, "angle_deg": None, "confidence": 0.0,
@@ -765,7 +842,9 @@ def main():
                     "gauge_x": round(current["cx"], 1), "gauge_y": round(current["cy"], 1), "gauge_radius": round(current["r"], 1),
                     "movement_px": round(movement_px, 1), "radius_change_percent": round(radius_change_pct, 1),
                     "locator_score": round(locator_score, 3),
+                    "cluster_score": round(locator_score, 3),
                     "cluster_confirmations": confirmation_count,
+                    "camera_rotation_deg": 0.0,
                     "status": "cluster_wird_bestaetigt" if confirmation_count else "cluster_nicht_gefunden",
                     "last_measurement": iso_now(),
                 }
@@ -815,7 +894,8 @@ def main():
                 client.publish(avail_topic, "online", qos=1, retain=True)
 
                 if bool(opt.get("debug", True)):
-                    save_debug(frame, current, baseline, roi, roi_x, roi_y, rcx, rcy, result, filtered, valid, gauge_found, moved, locator_score, current_cluster, last_candidates, confirmation_count)
+                    overview_bytes, roi_bytes = save_debug(frame, current, baseline, roi, roi_x, roi_y, rcx, rcy, result, filtered, valid, gauge_found, moved, locator_score, current_cluster, last_candidates, confirmation_count)
+                    publish_debug_images(client, base, overview_bytes, roi_bytes)
 
                 log(
                     f"raw={result['pressure_raw']:.2f} bar | median={filtered:.2f} bar | "
