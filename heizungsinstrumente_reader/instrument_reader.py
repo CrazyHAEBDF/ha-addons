@@ -1028,7 +1028,7 @@ def publish_instrument_discovery(client, opt):
         "identifiers": ["heizung_instrument_reader"],
         "name": "Heizungsinstrumente",
         "manufacturer": "Custom",
-        "model": "RTSP/OpenCV Instrument Reader 1.0.1",
+        "model": "RTSP/OpenCV Instrument Reader 1.0.2",
     }
     entities = []
     for key, oid, name in (
@@ -1166,7 +1166,10 @@ def instrument_main():
     interval = int(opt.get("interval_sec", 15))
     locate_interval = int(opt.get("locate_interval_sec", 600))
     confirmations_required = int(opt.get("cluster_confirmations", 3))
-    confidence_min = float(opt.get("confidence_min", 1.0))
+    thermometer_confidence_min = float(opt.get("thermometer_confidence_min", 1.15))
+    pressure_confidence_min = float(opt.get("pressure_confidence_min", 1.15))
+    bootstrap_required = int(opt.get("bootstrap_confirmations", 3))
+    change_required = int(opt.get("change_confirmations", 2))
     failures_limit = int(opt.get("failures_until_unavailable", 3))
     histories = {key: deque(maxlen=int(opt.get("median_window", 5))) for key in ("return", "supply", "pressure")}
     stability = {key: {"accepted": None, "pending": None, "pending_count": 0} for key in ("return", "supply", "pressure")}

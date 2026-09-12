@@ -1,4 +1,10 @@
-# Heizungs Instrument Reader 1.0.1
+# Heizungs Instrument Reader 1.0.2
+
+## Korrektur in 1.0.2
+
+- behebt die fehlenden Laufzeitvariablen für Confidence-, Start- und Sprungfilter
+- bestätigt größere Änderungen standardmäßig mit zwei Messungen innerhalb von
+  etwa 15 Sekunden
 
 ## Neu in 1.0.1
 
