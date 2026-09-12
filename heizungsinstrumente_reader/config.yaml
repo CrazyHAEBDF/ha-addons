@@ -1,5 +1,5 @@
 name: "Heizungs Instrument Reader"
-version: "1.0.3"
+version: "1.0.4"
 slug: "instrument_reader"
 description: "Liest Heizungsdruck, Rücklauf- und Zulauftemperatur gemeinsam aus einem RTSP-Bild und veröffentlicht alles per MQTT."
 url: "https://github.com/DEIN_GITHUB_NAME/ha-addons"
@@ -30,6 +30,10 @@ options:
   cluster_confirmations: 3
   cluster_confirmation_px: 18
   cluster_confirmation_angle_deg: 8.0
+  cluster_max_rotation_change_deg: 25.0
+  cluster_min_scale_ratio: 0.70
+  cluster_max_scale_ratio: 1.40
+  cluster_max_tracking_shift_px: 250
   cluster_gauge_offset_x_ratio: 0.73
   cluster_gauge_offset_y_ratio: 1.61
   cluster_tolerance: 0.32
@@ -88,6 +92,10 @@ schema:
   cluster_confirmations: "int(1,10)"
   cluster_confirmation_px: "int(1,200)"
   cluster_confirmation_angle_deg: float
+  cluster_max_rotation_change_deg: float
+  cluster_min_scale_ratio: float
+  cluster_max_scale_ratio: float
+  cluster_max_tracking_shift_px: "int(0,2000)"
   cluster_gauge_offset_x_ratio: float
   cluster_gauge_offset_y_ratio: float
   cluster_tolerance: float

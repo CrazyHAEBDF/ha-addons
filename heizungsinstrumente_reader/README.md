@@ -1,4 +1,13 @@
-# Heizungs Instrument Reader 1.0.3
+# Heizungs Instrument Reader 1.0.4
+
+## Korrektur in 1.0.4
+
+- verwirft bei vorhandener Referenz geometrisch ähnliche, aber stark gedrehte
+  oder unplausibel skalierte Cluster
+- begrenzt die automatische Nachführung auf eine plausible Bildverschiebung
+- verhindert einen `NoneType.__round__`-Fehler, wenn bereits die erste
+  Messung eine zu geringe Confidence hat
+- verwendet bei einem verworfenen Cluster keine erfundenen Messwerte
 
 ## Optimierung in 1.0.3
 

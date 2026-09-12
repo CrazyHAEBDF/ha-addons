@@ -336,6 +336,28 @@ def detect_cluster(frame, opt, expected_gauge=None, reference_cluster=None):
                         reference_cluster["t2"]["cx"] - reference_cluster["t1"]["cx"],
                         reference_cluster["t2"]["cy"] - reference_cluster["t1"]["cy"],
                     )
+                    scale_ratio = spacing / max(ref_spacing, 1.0)
+                    min_scale = float(opt.get("cluster_min_scale_ratio", 0.70))
+                    max_scale = float(opt.get("cluster_max_scale_ratio", 1.40))
+                    if not min_scale <= scale_ratio <= max_scale:
+                        continue
+
+                    observed_angle = math.degrees(math.atan2(vy, vx))
+                    reference_angle = cluster_angle(reference_cluster)
+                    rotation_delta = (observed_angle - reference_angle + 180.0) % 360.0 - 180.0
+                    max_rotation = float(opt.get("cluster_max_rotation_change_deg", 25.0))
+                    if abs(rotation_delta) > max_rotation:
+                        continue
+
+                    max_shift = float(opt.get("cluster_max_tracking_shift_px", 250.0))
+                    if expected_gauge is not None and max_shift > 0:
+                        tracking_shift = math.hypot(
+                            gauge["cx"] - expected_gauge["cx"],
+                            gauge["cy"] - expected_gauge["cy"],
+                        )
+                        if tracking_shift > max_shift:
+                            continue
+
                     ref_ratio = math.hypot(
                         reference_cluster["gauge"]["cx"] - reference_cluster["t2"]["cx"],
                         reference_cluster["gauge"]["cy"] - reference_cluster["t2"]["cy"],
@@ -1060,7 +1082,9 @@ def pressure_options(opt):
 def stabilize_measurement(state, raw_value, confidence_ok, max_change, bootstrap_required, change_required):
     """Reject isolated jumps while still allowing a sustained real change."""
     if not confidence_ok:
-        return state.get("accepted", raw_value), False, "confidence_low"
+        accepted = state.get("accepted")
+        safe_value = float(raw_value) if accepted is None else float(accepted)
+        return safe_value, False, "confidence_low"
 
     accepted = state.get("accepted")
     if accepted is None:
@@ -1109,7 +1133,7 @@ def publish_instrument_discovery(client, opt):
         "identifiers": ["heizung_instrument_reader"],
         "name": "Heizungsinstrumente",
         "manufacturer": "Custom",
-        "model": "RTSP/OpenCV Instrument Reader 1.0.3",
+        "model": "RTSP/OpenCV Instrument Reader 1.0.4",
     }
     entities = []
     for key, oid, name in (
