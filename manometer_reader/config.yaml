@@ -1,7 +1,7 @@
 name: "Manometer Reader"
-version: "0.3.1"
+version: "0.4.0"
 slug: "manometer_reader"
-description: "Liest ein analoges Heizungsmanometer per RTSP/OpenCV und veröffentlicht den Druck per MQTT."
+description: "Liest ein analoges Heizungsmanometer per RTSP/OpenCV, verfolgt es automatisch im Bild und veröffentlicht Druck und Diagnose per MQTT."
 url: "https://github.com/DEIN_GITHUB_NAME/ha-addons"
 
 arch:
@@ -19,6 +19,7 @@ map:
 
 options:
   rtsp_url: ""
+
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_username: ""
@@ -26,29 +27,40 @@ options:
   mqtt_base_topic: "manometer/heizung"
   mqtt_discovery_prefix: "homeassistant"
 
-  interval_sec: 15
+  interval_sec: 60
+  capture_timeout_sec: 12
+  backoff_max_sec: 300
+
+  auto_locate: true
+  auto_locate_interval_sec: 600
+  auto_locate_after_invalid: 2
+  template_match_min: 0.55
+  movement_warning_px: 18
+  radius_warning_percent: 20
+  rebaseline_on_start: false
 
   roi_x: 982
   roi_y: 502
   roi_w: 60
   roi_h: 60
-
   center_x: 30
   center_y: 30
   radius: 24
+
+  auto_min_radius: 14
+  auto_max_radius: 80
 
   angle_min_deg: 225.0
   angle_max_deg: 315.0
   scale_min: 0.0
   scale_max: 4.0
   clockwise: true
-
   search_max_value: 4.0
 
   scan_inner_ratio: 0.40
-  scan_outer_ratio: 0.85
+  scan_outer_ratio: 0.92
   line_half_width_px: 1
-  processing_scale: 4
+  processing_scale: 3
 
   median_window: 5
   confidence_min: 1.0
@@ -58,6 +70,7 @@ options:
 
 schema:
   rtsp_url: str
+
   mqtt_host: str
   mqtt_port: port
   mqtt_username: str
@@ -65,24 +78,36 @@ schema:
   mqtt_base_topic: str
   mqtt_discovery_prefix: str
 
-  interval_sec: "int(5,3600)"
+  interval_sec: "int(15,3600)"
+  capture_timeout_sec: "int(5,60)"
+  backoff_max_sec: "int(30,3600)"
+
+  auto_locate: bool
+  auto_locate_interval_sec: "int(60,86400)"
+  auto_locate_after_invalid: "int(1,20)"
+  template_match_min: float
+  movement_warning_px: "int(1,1000)"
+  radius_warning_percent: "int(1,100)"
+  rebaseline_on_start: bool
 
   roi_x: "int(0,10000)"
   roi_y: "int(0,10000)"
   roi_w: "int(20,5000)"
   roi_h: "int(20,5000)"
-
   center_x: "int(0,5000)"
   center_y: "int(0,5000)"
   radius: "int(5,2500)"
+
+  auto_min_radius: "int(5,1000)"
+  auto_max_radius: "int(10,2000)"
 
   angle_min_deg: float
   angle_max_deg: float
   scale_min: float
   scale_max: float
   clockwise: bool
-
   search_max_value: float
+
   scan_inner_ratio: float
   scan_outer_ratio: float
   line_half_width_px: "int(0,20)"

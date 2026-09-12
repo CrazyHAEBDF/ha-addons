@@ -1,32 +1,52 @@
-# Manometer Reader
+# Manometer Reader 0.4.0
 
-Home-Assistant-Add-on/App zum Ablesen eines analogen Heizungsmanometers über einen RTSP-Stream.
+Home-Assistant-App für ein analoges Heizungsmanometer über RTSP/Tapo + OpenCV + MQTT.
 
-## Standardkalibrierung für das gezeigte Caleffi-Manometer
+## Neu in 0.4.0
 
-- Skala: 0–4 bar
-- Nullpunkt: ca. 225°
-- Endpunkt: ca. 315°
-- Drehrichtung mit steigendem Druck: im Uhrzeigersinn
-- Erwarteter Heizungsbereich: 1,5–2,5 bar
-- Kritischer Bereich: ab 3,0 bar
-- `search_max_value` ist absichtlich auf 3,2 bar begrenzt, damit die dünne Gegenseite des Zeigers nicht als Zeigerspitze interpretiert wird.
+- automatische Lokalisierung des Manometers
+- automatische Nachführung, wenn die Kamera verschoben wurde
+- persistente Referenz in `/config/calibration.json`
+- Template des Manometers in `/config/gauge_template.jpg`
+- Warnung `Kamera verschoben` per MQTT Discovery
+- Diagnose-Entities für Position, Radius, Qualität und Status
+- Druck wird bei fehlender/unsicherer Erkennung `unavailable`; echte 0 bar bleiben ein gültiger Messwert
+- CPU-schonender Standard: Messung alle 60 s, ffmpeg mit niedriger Priorität und einem Decoder-Thread
+- exponentieller Backoff bei RTSP-Fehlern
+- Zeigersuche gewichtet den äußeren Radius stärker, damit der lange dünne Messzeiger gegenüber dem kurzen breiten Gegengewicht bevorzugt wird
 
-## Tapo-IR-Screenshot
+## Referenz / Autokalibrierung
 
-Für den bereitgestellten 2048x1152-Screenshot sind die Startwerte:
+Beim ersten erfolgreichen Start wird die aktuelle Manometerposition als Referenz gespeichert. Danach sucht die App das gleiche Instrument regelmäßig erneut und folgt dessen neuer Position automatisch.
 
-- ROI: x=982, y=502, w=60, h=60
-- Mittelpunkt im ROI: x=30, y=30
-- Radius: 24
+Wenn die Kamera bewusst dauerhaft neu ausgerichtet wurde, einmal `rebaseline_on_start: true` setzen und die App starten. Danach die Option wieder auf `false` stellen, damit die neue Referenz erhalten bleibt.
 
-Diese Werte sind Startwerte. Bitte mit `debug/latest_roi.jpg` kontrollieren und ggf. um wenige Pixel anpassen.
+## Dateien im App-Konfigurationsordner
 
-## Debugdateien
+- `calibration.json` – gespeicherte Referenz und letzte Position
+- `gauge_template.jpg` – visuelle Vorlage für die Nachführung
+- `debug/latest_frame.jpg` – Vollbild mit erkannter Position
+- `debug/latest_roi.jpg` – vergrößerter Manometerausschnitt mit erkanntem Zeiger
 
-Bei `debug: true` werden geschrieben:
+Auf HAOS liegen diese Dateien im jeweiligen App-Ordner unter `/addon_configs/..._manometer_reader/`.
 
-- `/config/debug/latest_roi.jpg`
-- `/config/debug/latest_frame.jpg`
+## Wichtige Optionen
 
-Auf dem HAOS-Host liegen diese im add-on-spezifischen Ordner unter `/addon_configs/..._manometer_reader/debug/`.
+- `interval_sec: 60` – Messintervall; für Heizungsdruck reichen 30–60 s normalerweise aus
+- `auto_locate_interval_sec: 600` – vollständige Positionsprüfung alle 10 Minuten
+- `auto_locate_after_invalid: 2` – bei zwei unsicheren Zeigermessungen sofort neu lokalisieren
+- `movement_warning_px: 18` – ab dieser Positionsabweichung wird `Kamera verschoben` aktiv
+- `template_match_min: 0.55` – Mindestähnlichkeit zur gespeicherten Vorlage
+- `rebaseline_on_start: false` – nur einmal auf true setzen, wenn eine neue Kameraposition als normal akzeptiert werden soll
+
+## MQTT-Entities
+
+- Heizungsdruck
+- Manometer erkannt
+- Kamera verschoben
+- Messung gültig
+- Erkennungsqualität
+- Manometer X / Y / Radius
+- Kamera Verschiebung
+- Manometer Status
+

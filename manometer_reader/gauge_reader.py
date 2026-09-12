@@ -1,4 +1,3 @@
-\
 import json
 import math
 import os
@@ -13,9 +12,11 @@ import cv2
 import numpy as np
 import paho.mqtt.client as mqtt
 
-
 OPTIONS_FILE = "/data/options.json"
-DEBUG_DIR = Path("/config/debug")
+CONFIG_DIR = Path("/config")
+DEBUG_DIR = CONFIG_DIR / "debug"
+CALIBRATION_FILE = CONFIG_DIR / "calibration.json"
+TEMPLATE_FILE = CONFIG_DIR / "gauge_template.jpg"
 
 
 def log(msg):
@@ -27,13 +28,19 @@ def load_options():
         return json.load(f)
 
 
+def iso_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
 def capture_rtsp_frame(rtsp_url, timeout=12):
     cmd = [
+        "nice", "-n", "10",
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
         "-loglevel", "error",
         "-rtsp_transport", "tcp",
+        "-threads", "1",
         "-i", rtsp_url,
         "-frames:v", "1",
         "-an",
@@ -41,7 +48,6 @@ def capture_rtsp_frame(rtsp_url, timeout=12):
         "-vcodec", "mjpeg",
         "pipe:1",
     ]
-
     try:
         p = subprocess.run(
             cmd,
@@ -55,23 +61,235 @@ def capture_rtsp_frame(rtsp_url, timeout=12):
 
     if p.returncode != 0 or not p.stdout:
         err = p.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"ffmpeg konnte kein Bild lesen: {err[-500:]}")
+        raise RuntimeError(f"ffmpeg konnte kein Bild lesen: {err[-700:]}")
 
     arr = np.frombuffer(p.stdout, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if frame is None:
         raise RuntimeError("JPEG-Frame konnte nicht dekodiert werden")
-
     return frame
 
 
-def crop_roi(frame, x, y, w, h):
+def crop_square(frame, cx, cy, half):
+    h, w = frame.shape[:2]
+    x1 = max(0, int(round(cx - half)))
+    y1 = max(0, int(round(cy - half)))
+    x2 = min(w, int(round(cx + half)))
+    y2 = min(h, int(round(cy + half)))
+    if x2 - x1 < 10 or y2 - y1 < 10:
+        raise RuntimeError("ROI zu klein oder außerhalb des Bildes")
+    return frame[y1:y2, x1:x2].copy(), x1, y1
+
+
+def manual_geometry(opt):
+    return {
+        "cx": float(int(opt["roi_x"]) + int(opt["center_x"])),
+        "cy": float(int(opt["roi_y"]) + int(opt["center_y"])),
+        "r": float(int(opt["radius"])),
+        "source": "manual",
+        "score": 0.0,
+    }
+
+
+def load_calibration():
+    if not CALIBRATION_FILE.exists():
+        return None
+    try:
+        with CALIBRATION_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if all(k in data for k in ("baseline_cx", "baseline_cy", "baseline_r")):
+            return data
+    except Exception as exc:
+        log(f"Kalibrierdatei konnte nicht gelesen werden: {exc}")
+    return None
+
+
+def save_calibration(baseline, current):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "baseline_cx": round(float(baseline["cx"]), 3),
+        "baseline_cy": round(float(baseline["cy"]), 3),
+        "baseline_r": round(float(baseline["r"]), 3),
+        "current_cx": round(float(current["cx"]), 3),
+        "current_cy": round(float(current["cy"]), 3),
+        "current_r": round(float(current["r"]), 3),
+        "updated": iso_now(),
+    }
+    tmp = CALIBRATION_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, CALIBRATION_FILE)
+
+
+def create_template(frame, geom):
+    # Umgebung mitspeichern: macht das Ziel auch bei mehreren runden Instrumenten eindeutig.
+    half = max(20, int(round(geom["r"] * 1.45)))
+    patch, _, _ = crop_square(frame, geom["cx"], geom["cy"], half)
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    cv2.imwrite(str(TEMPLATE_FILE), gray)
+
+
+def circle_edge_score(gray, cx, cy, r):
+    edges = cv2.Canny(gray, 60, 150)
+    vals = []
+    h, w = gray.shape[:2]
+    for rr in (0.90 * r, r, 1.08 * r):
+        for deg in range(0, 360, 6):
+            t = math.radians(deg)
+            x = int(round(cx + rr * math.cos(t)))
+            y = int(round(cy + rr * math.sin(t)))
+            if 0 <= x < w and 0 <= y < h:
+                vals.append(float(edges[y, x]) / 255.0)
+    return float(np.mean(vals)) if vals else 0.0
+
+
+def hough_in_region(frame, x1, y1, x2, y2, min_r, max_r, expected=None):
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 30 or y2 - y1 < 30:
+        return None
+
+    crop = frame[y1:y2, x1:x2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 1.2)
+
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(12, int(min_r * 1.2)),
+        param1=110,
+        param2=18,
+        minRadius=max(5, int(min_r)),
+        maxRadius=max(int(min_r) + 2, int(max_r)),
+    )
+    if circles is None:
+        return None
+
+    best = None
+    for c in np.round(circles[0]).astype(int):
+        cx, cy, r = int(c[0]), int(c[1]), int(c[2])
+        edge = circle_edge_score(gray, cx, cy, r)
+        score = edge
+        if expected is not None:
+            ex = float(expected["cx"]) - x1
+            ey = float(expected["cy"]) - y1
+            er = max(float(expected["r"]), 1.0)
+            dist = math.hypot(cx - ex, cy - ey) / max(er * 5.0, 1.0)
+            rdiff = abs(r - er) / er
+            score += max(0.0, 0.55 - 0.30 * dist - 0.25 * rdiff)
+        candidate = {
+            "cx": float(cx + x1),
+            "cy": float(cy + y1),
+            "r": float(r),
+            "source": "circle",
+            "score": float(score),
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best
+
+
+def locate_by_circle(frame, expected, opt):
+    r = max(8.0, float(expected["r"]))
+    margin = max(90, int(round(r * 5.0)))
+    local = hough_in_region(
+        frame,
+        int(expected["cx"] - margin),
+        int(expected["cy"] - margin),
+        int(expected["cx"] + margin),
+        int(expected["cy"] + margin),
+        max(8, int(r * 0.65)),
+        max(12, int(r * 1.45)),
+        expected=expected,
+    )
+    if local is not None:
+        return local
+
+    # Globaler Fallback: nur bei Bedarf. Auf ca. 1024 px Breite verkleinern.
     fh, fw = frame.shape[:2]
-    if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
-        raise RuntimeError(
-            f"ROI [{x},{y},{w},{h}] liegt außerhalb des Frames {fw}x{fh}"
-        )
-    return frame[y:y+h, x:x+w].copy()
+    scale = min(1.0, 1024.0 / float(fw))
+    small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    min_r = max(5, int(float(opt.get("auto_min_radius", 14)) * scale))
+    max_r = max(min_r + 2, int(float(opt.get("auto_max_radius", 80)) * scale))
+    exp_small = {
+        "cx": expected["cx"] * scale,
+        "cy": expected["cy"] * scale,
+        "r": expected["r"] * scale,
+    }
+    found = hough_in_region(
+        small, 0, 0, small.shape[1], small.shape[0], min_r, max_r, expected=exp_small
+    )
+    if found is None:
+        return None
+    found["cx"] /= scale
+    found["cy"] /= scale
+    found["r"] /= scale
+    found["source"] = "circle_global"
+    return found
+
+
+def locate_by_template(frame, baseline, min_score):
+    if not TEMPLATE_FILE.exists():
+        return None
+    templ0 = cv2.imread(str(TEMPLATE_FILE), cv2.IMREAD_GRAYSCALE)
+    if templ0 is None or templ0.shape[0] < 12 or templ0.shape[1] < 12:
+        return None
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    best = None
+    # Kleine Skalierungsänderungen durch Kamera-/Objektbewegung tolerieren.
+    for scale in (0.82, 0.90, 0.96, 1.00, 1.05, 1.12, 1.20):
+        tw = int(round(templ0.shape[1] * scale))
+        th = int(round(templ0.shape[0] * scale))
+        if tw < 12 or th < 12 or tw >= gray.shape[1] or th >= gray.shape[0]:
+            continue
+        templ = cv2.resize(templ0, (tw, th), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+        result = cv2.matchTemplate(gray, templ, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if best is None or max_val > best["score"]:
+            best = {
+                "cx": float(max_loc[0] + tw / 2.0),
+                "cy": float(max_loc[1] + th / 2.0),
+                "r": float(baseline["r"] * scale),
+                "source": "template",
+                "score": float(max_val),
+            }
+    if best is None or best["score"] < min_score:
+        return None
+    return best
+
+
+def auto_locate(frame, expected, baseline, opt):
+    # Nach der ersten Kalibrierung ist Template Matching meist eindeutiger als reine Kreissuche.
+    if baseline is not None:
+        found = locate_by_template(frame, baseline, float(opt.get("template_match_min", 0.55)))
+        if found is not None:
+            # Lokale Kreisverfeinerung um Template-Position; bei Fehlschlag Template-Geometrie behalten.
+            refined = locate_by_circle(frame, found, opt)
+            if refined is not None and math.hypot(refined["cx"] - found["cx"], refined["cy"] - found["cy"]) < max(35, found["r"] * 2.0):
+                refined["source"] = "template+circle"
+                refined["score"] = max(refined["score"], found["score"])
+                return refined
+            return found
+    return locate_by_circle(frame, expected, opt)
+
+
+def movement_state(current, baseline, opt):
+    if baseline is None:
+        return False, 0.0, 0.0
+    shift = math.hypot(current["cx"] - baseline["cx"], current["cy"] - baseline["cy"])
+    radius_pct = 100.0 * abs(current["r"] - baseline["r"]) / max(baseline["r"], 1.0)
+    moved = shift >= float(opt.get("movement_warning_px", 18)) or radius_pct >= float(opt.get("radius_warning_percent", 20))
+    return moved, shift, radius_pct
+
+
+def build_roi_from_geometry(frame, geom):
+    # Groß genug für Skalenrand und Debugtext; Mittelpunkt wird relativ zur ROI zurückgegeben.
+    half = max(18, int(round(geom["r"] * 1.25)))
+    roi, x1, y1 = crop_square(frame, geom["cx"], geom["cy"], half)
+    return roi, x1, y1, geom["cx"] - x1, geom["cy"] - y1
 
 
 def clockwise_distance(start_deg, end_deg):
@@ -82,40 +300,25 @@ def counterclockwise_distance(start_deg, end_deg):
     return (end_deg - start_deg) % 360.0
 
 
-def detect_needle(
-    roi,
-    center_x,
-    center_y,
-    radius,
-    angle_min_deg,
-    angle_max_deg,
-    scale_min,
-    scale_max,
-    clockwise,
-    search_max_value,
-    scan_inner_ratio,
-    scan_outer_ratio,
-    line_half_width_px,
-    processing_scale,
-):
+def detect_needle(roi, center_x, center_y, radius, opt):
+    angle_min_deg = float(opt["angle_min_deg"])
+    angle_max_deg = float(opt["angle_max_deg"])
+    scale_min = float(opt["scale_min"])
+    scale_max = float(opt["scale_max"])
+    clockwise = bool(opt["clockwise"])
+    search_max_value = float(opt["search_max_value"])
+    scan_inner_ratio = float(opt["scan_inner_ratio"])
+    scan_outer_ratio = float(opt["scan_outer_ratio"])
+    line_half_width_px = int(opt["line_half_width_px"])
+    processing_scale = int(opt["processing_scale"])
+
     if scale_max <= scale_min:
         raise RuntimeError("scale_max muss größer als scale_min sein")
-
     if not 0.0 <= scan_inner_ratio < scan_outer_ratio <= 1.0:
-        raise RuntimeError("scan_inner_ratio/scan_outer_ratio müssen zwischen 0 und 1 liegen")
+        raise RuntimeError("scan_inner_ratio/scan_outer_ratio ungültig")
 
-    s = max(1, int(processing_scale))
-    if s > 1:
-        proc = cv2.resize(
-            roi,
-            None,
-            fx=s,
-            fy=s,
-            interpolation=cv2.INTER_CUBIC,
-        )
-    else:
-        proc = roi.copy()
-
+    s = max(1, processing_scale)
+    proc = cv2.resize(roi, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC) if s > 1 else roi.copy()
     cx = float(center_x * s)
     cy = float(center_y * s)
     rad = float(radius * s)
@@ -126,369 +329,337 @@ def detect_needle(
     gray = clahe.apply(gray)
     darkness = 255.0 - gray.astype(np.float32)
 
-    if clockwise:
-        sweep = clockwise_distance(angle_min_deg, angle_max_deg)
-    else:
-        sweep = counterclockwise_distance(angle_min_deg, angle_max_deg)
-
-    if sweep <= 0.0:
+    sweep = clockwise_distance(angle_min_deg, angle_max_deg) if clockwise else counterclockwise_distance(angle_min_deg, angle_max_deg)
+    if sweep <= 0:
         raise RuntimeError("Ungültiger Skalenwinkel")
 
     search_max_value = min(max(search_max_value, scale_min), scale_max)
-    max_fraction = (search_max_value - scale_min) / (scale_max - scale_min)
-    max_delta = sweep * max_fraction
-
-    # 0,5° ist bei einem kleinen Manometer mehr als fein genug.
+    max_delta = sweep * (search_max_value - scale_min) / (scale_max - scale_min)
     deltas = np.arange(0.0, max_delta + 0.001, 0.5, dtype=np.float32)
 
     r_start = scan_inner_ratio * rad
     r_end = scan_outer_ratio * rad
-    radial_count = max(8, int(r_end - r_start) + 1)
-    radii = np.linspace(r_start, r_end, radial_count, dtype=np.float32)
+    radii = np.linspace(r_start, r_end, max(10, int(r_end - r_start) + 1), dtype=np.float32)
+    # Äußeren Bereich stärker gewichten: bevorzugt den langen dünnen Messzeiger gegenüber dem kurzen breiten Gegengewicht.
+    radial_weights = np.linspace(0.55, 2.25, len(radii), dtype=np.float32)
 
     scores = np.zeros(len(deltas), dtype=np.float32)
-
     h, w = darkness.shape[:2]
 
     for i, delta in enumerate(deltas):
-        if clockwise:
-            angle = (angle_min_deg - float(delta)) % 360.0
-        else:
-            angle = (angle_min_deg + float(delta)) % 360.0
-
+        angle = (angle_min_deg - float(delta)) % 360.0 if clockwise else (angle_min_deg + float(delta)) % 360.0
         theta = math.radians(angle)
+        dx, dy = math.cos(theta), -math.sin(theta)
+        px, py = math.sin(theta), math.cos(theta)
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        continuity_hits = 0
+        samples = 0
 
-        # Bildkoordinaten: y wächst nach unten.
-        dx = math.cos(theta)
-        dy = -math.sin(theta)
-
-        # Senkrechte Richtung zur Zeigerlinie.
-        px = math.sin(theta)
-        py = math.cos(theta)
-
-        vals = []
-
-        for r in radii:
-            bx = cx + float(r) * dx
-            by = cy + float(r) * dy
-
+        for ridx, r in enumerate(radii):
+            vals = []
+            bx, by = cx + float(r) * dx, cy + float(r) * dy
             for off in range(-half_width, half_width + 1):
                 xx = int(round(bx + off * px))
                 yy = int(round(by + off * py))
-
                 if 0 <= xx < w and 0 <= yy < h:
                     vals.append(float(darkness[yy, xx]))
+            if vals:
+                v = float(np.mean(vals))
+                wt = float(radial_weights[ridx])
+                weighted_sum += v * wt
+                weight_sum += wt
+                samples += 1
+                if v >= 55.0:
+                    continuity_hits += 1
 
-        if vals:
-            scores[i] = float(np.mean(vals))
+        if weight_sum > 0:
+            darkness_score = weighted_sum / weight_sum
+            continuity = continuity_hits / max(samples, 1)
+            scores[i] = darkness_score * (0.70 + 0.30 * continuity)
 
-    # Ein wenig Winkelsmoothing reduziert Pixelrauschen besonders im IR-Bild.
     smooth = cv2.GaussianBlur(scores.reshape(1, -1), (0, 0), 1.2).ravel()
-
     best_idx = int(np.argmax(smooth))
     best_delta = float(deltas[best_idx])
-
-    if clockwise:
-        angle = (angle_min_deg - best_delta) % 360.0
-    else:
-        angle = (angle_min_deg + best_delta) % 360.0
-
+    angle = (angle_min_deg - best_delta) % 360.0 if clockwise else (angle_min_deg + best_delta) % 360.0
     pressure_raw = scale_min + (best_delta / sweep) * (scale_max - scale_min)
-
     median_score = float(np.median(smooth))
     std_score = float(np.std(smooth))
     confidence = (float(smooth[best_idx]) - median_score) / max(std_score, 1e-6)
 
     return {
-        "pressure_raw": pressure_raw,
-        "angle_deg": angle,
-        "confidence": confidence,
+        "pressure_raw": float(pressure_raw),
+        "angle_deg": float(angle),
+        "confidence": float(confidence),
         "score": float(smooth[best_idx]),
-        "processed": proc,
-        "proc_center": (int(round(cx)), int(round(cy))),
-        "proc_radius": int(round(rad)),
     }
 
 
-def save_debug(
-    full_frame,
-    roi,
-    roi_x,
-    roi_y,
-    center_x,
-    center_y,
-    radius,
-    result,
-    filtered_pressure,
-    valid,
-):
+def save_debug(frame, geom, baseline, roi, roi_x, roi_y, center_x, center_y, result, filtered, valid, gauge_found, moved, locator_score):
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-
-    annotated_roi = roi.copy()
-
-    cx = int(center_x)
-    cy = int(center_y)
-    r = int(radius)
-
-    cv2.circle(annotated_roi, (cx, cy), r, (255, 255, 255), 1)
-    cv2.circle(annotated_roi, (cx, cy), 2, (0, 255, 255), -1)
-
-    angle = float(result["angle_deg"])
-    theta = math.radians(angle)
-
-    x2 = int(round(cx + r * 0.78 * math.cos(theta)))
-    y2 = int(round(cy - r * 0.78 * math.sin(theta)))
-
-    cv2.line(annotated_roi, (cx, cy), (x2, y2), (0, 0, 255), 2)
-
-    txt1 = f"raw={result['pressure_raw']:.2f} bar"
-    txt2 = f"med={filtered_pressure:.2f} conf={result['confidence']:.2f}"
-    txt3 = f"angle={result['angle_deg']:.1f} valid={valid}"
-
-    cv2.putText(annotated_roi, txt1, (2, 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(annotated_roi, txt2, (2, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(annotated_roi, txt3, (2, 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 0), 1, cv2.LINE_AA)
-
-    # Für die winzige Tapo-ROI zusätzlich groß abspeichern.
-    zoom = cv2.resize(
-        annotated_roi,
-        None,
-        fx=6,
-        fy=6,
-        interpolation=cv2.INTER_NEAREST,
-    )
-    cv2.imwrite(str(DEBUG_DIR / "latest_roi.jpg"), zoom)
-
-    overview = full_frame.copy()
-    cv2.rectangle(
-        overview,
-        (roi_x, roi_y),
-        (roi_x + roi.shape[1], roi_y + roi.shape[0]),
-        (0, 0, 255),
-        2,
-    )
+    overview = frame.copy()
+    cx, cy, r = int(round(geom["cx"])), int(round(geom["cy"])), int(round(geom["r"]))
+    cv2.circle(overview, (cx, cy), r, (255, 255, 255), 2)
+    cv2.circle(overview, (cx, cy), 3, (0, 255, 255), -1)
+    if baseline is not None:
+        bcx, bcy, br = int(round(baseline["cx"])), int(round(baseline["cy"])), int(round(baseline["r"]))
+        cv2.circle(overview, (bcx, bcy), br, (180, 180, 180), 1)
+    cv2.rectangle(overview, (roi_x, roi_y), (roi_x + roi.shape[1], roi_y + roi.shape[0]), (255, 255, 255), 1)
+    cv2.putText(overview, f"found={gauge_found} moved={moved} source={geom.get('source','?')} loc={locator_score:.2f}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
     cv2.imwrite(str(DEBUG_DIR / "latest_frame.jpg"), overview)
+
+    annotated = roi.copy()
+    rcx, rcy = int(round(center_x)), int(round(center_y))
+    rr = int(round(geom["r"]))
+    cv2.circle(annotated, (rcx, rcy), rr, (255,255,255), 1)
+    t = math.radians(float(result["angle_deg"]))
+    x2 = int(round(rcx + rr * 0.90 * math.cos(t)))
+    y2 = int(round(rcy - rr * 0.90 * math.sin(t)))
+    cv2.line(annotated, (rcx, rcy), (x2, y2), (0,0,255), 2)
+    cv2.putText(annotated, f"raw {result['pressure_raw']:.2f} med {filtered:.2f}", (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255,255,255), 1, cv2.LINE_AA)
+    cv2.putText(annotated, f"conf {result['confidence']:.2f} valid {valid}", (2, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255,255,255), 1, cv2.LINE_AA)
+    zoom = cv2.resize(annotated, None, fx=7, fy=7, interpolation=cv2.INTER_NEAREST)
+    cv2.imwrite(str(DEBUG_DIR / "latest_roi.jpg"), zoom)
 
 
 def mqtt_client_from_options(opt):
     base = opt["mqtt_base_topic"].rstrip("/")
     avail_topic = f"{base}/availability"
-
-    client = mqtt.Client(
-        mqtt.CallbackAPIVersion.VERSION2,
-        client_id="ha_manometer_reader",
-        clean_session=True,
-    )
-
-    username = opt.get("mqtt_username", "")
-    password = opt.get("mqtt_password", "")
-
-    if username:
-        client.username_pw_set(username, password)
-
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ha_manometer_reader", clean_session=True)
+    if opt.get("mqtt_username", ""):
+        client.username_pw_set(opt.get("mqtt_username", ""), opt.get("mqtt_password", ""))
     client.will_set(avail_topic, payload="offline", qos=1, retain=True)
     client.connect(opt["mqtt_host"], int(opt["mqtt_port"]), 60)
     client.loop_start()
-
     deadline = time.time() + 10
     while not client.is_connected() and time.time() < deadline:
         time.sleep(0.1)
-
     if not client.is_connected():
         raise RuntimeError("MQTT-Verbindung konnte nicht hergestellt werden")
-
     return client
+
+
+def discovery_sensor(discovery, component, object_id, config):
+    return f"{discovery}/{component}/{object_id}/config", json.dumps(config)
 
 
 def publish_discovery(client, opt):
     base = opt["mqtt_base_topic"].rstrip("/")
     discovery = opt["mqtt_discovery_prefix"].rstrip("/")
-
     state_topic = f"{base}/state"
     avail_topic = f"{base}/availability"
-
-    pressure_config_topic = f"{discovery}/sensor/manometer_heizung_druck/config"
-    quality_config_topic = f"{discovery}/binary_sensor/manometer_heizung_erkennung/config"
-
+    pressure_avail = f"{base}/pressure_availability"
     device = {
         "identifiers": ["manometer_heizung"],
         "name": "Heizungsmanometer",
         "manufacturer": "Custom",
-        "model": "RTSP/OpenCV Gauge Reader",
+        "model": "RTSP/OpenCV Gauge Reader 0.4",
     }
 
-    pressure_config = {
-        "name": "Heizungsdruck",
-        "unique_id": "manometer_heizung_druck",
-        "state_topic": state_topic,
-        "value_template": "{{ value_json.pressure }}",
-        "unit_of_measurement": "bar",
-        "device_class": "pressure",
-        "state_class": "measurement",
-        "availability_topic": avail_topic,
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "json_attributes_topic": state_topic,
-        "device": device,
-    }
+    entities = []
+    entities.append(discovery_sensor(discovery, "sensor", "manometer_heizung_druck", {
+        "name": "Heizungsdruck", "unique_id": "manometer_heizung_druck",
+        "state_topic": state_topic, "value_template": "{{ value_json.pressure }}",
+        "unit_of_measurement": "bar", "device_class": "pressure", "state_class": "measurement",
+        "availability_topic": pressure_avail, "payload_available": "online", "payload_not_available": "offline",
+        "json_attributes_topic": state_topic, "device": device,
+    }))
+    entities.append(discovery_sensor(discovery, "binary_sensor", "manometer_heizung_gefunden", {
+        "name": "Manometer erkannt", "unique_id": "manometer_heizung_gefunden",
+        "state_topic": state_topic, "value_template": "{{ 'ON' if value_json.gauge_found else 'OFF' }}",
+        "payload_on": "ON", "payload_off": "OFF", "device_class": "connectivity",
+        "availability_topic": avail_topic, "device": device,
+    }))
+    entities.append(discovery_sensor(discovery, "binary_sensor", "manometer_heizung_kamera_verschoben", {
+        "name": "Kamera verschoben", "unique_id": "manometer_heizung_kamera_verschoben",
+        "state_topic": state_topic, "value_template": "{{ 'ON' if value_json.camera_moved else 'OFF' }}",
+        "payload_on": "ON", "payload_off": "OFF", "device_class": "problem",
+        "availability_topic": avail_topic, "device": device,
+    }))
+    entities.append(discovery_sensor(discovery, "binary_sensor", "manometer_heizung_messung_gueltig", {
+        "name": "Messung gültig", "unique_id": "manometer_heizung_messung_gueltig",
+        "state_topic": state_topic, "value_template": "{{ 'ON' if value_json.valid else 'OFF' }}",
+        "payload_on": "ON", "payload_off": "OFF", "availability_topic": avail_topic, "device": device,
+    }))
+    for oid, name, template, unit in [
+        ("manometer_heizung_confidence", "Erkennungsqualität", "{{ value_json.confidence }}", None),
+        ("manometer_heizung_position_x", "Manometer X", "{{ value_json.gauge_x }}", "px"),
+        ("manometer_heizung_position_y", "Manometer Y", "{{ value_json.gauge_y }}", "px"),
+        ("manometer_heizung_radius", "Manometer Radius", "{{ value_json.gauge_radius }}", "px"),
+        ("manometer_heizung_verschiebung", "Kamera Verschiebung", "{{ value_json.movement_px }}", "px"),
+    ]:
+        cfg = {"name": name, "unique_id": oid, "state_topic": state_topic, "value_template": template, "availability_topic": avail_topic, "device": device}
+        if unit:
+            cfg["unit_of_measurement"] = unit
+        entities.append(discovery_sensor(discovery, "sensor", oid, cfg))
+    entities.append(discovery_sensor(discovery, "sensor", "manometer_heizung_status", {
+        "name": "Manometer Status", "unique_id": "manometer_heizung_status",
+        "state_topic": state_topic, "value_template": "{{ value_json.status }}",
+        "availability_topic": avail_topic, "device": device,
+    }))
 
-    quality_config = {
-        "name": "Manometer Erkennung",
-        "unique_id": "manometer_heizung_erkennung",
-        "state_topic": state_topic,
-        "value_template": "{{ 'ON' if value_json.valid else 'OFF' }}",
-        "payload_on": "ON",
-        "payload_off": "OFF",
-        "availability_topic": avail_topic,
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "device_class": "connectivity",
-        "device": device,
-    }
-
-    client.publish(
-        pressure_config_topic,
-        json.dumps(pressure_config),
-        qos=1,
-        retain=True,
-    )
-    client.publish(
-        quality_config_topic,
-        json.dumps(quality_config),
-        qos=1,
-        retain=True,
-    )
+    for topic, payload in entities:
+        client.publish(topic, payload, qos=1, retain=True)
     client.publish(avail_topic, "online", qos=1, retain=True)
-
-
-def iso_now():
-    return datetime.now(timezone.utc).isoformat()
+    client.publish(pressure_avail, "offline", qos=1, retain=True)
 
 
 def main():
     opt = load_options()
-
-    required = ["rtsp_url", "mqtt_host", "mqtt_port", "mqtt_base_topic"]
-    for key in required:
+    for key in ("rtsp_url", "mqtt_host", "mqtt_port", "mqtt_base_topic"):
         if opt.get(key) in (None, ""):
             raise RuntimeError(f"Pflichtoption fehlt: {key}")
 
-    interval = int(opt.get("interval_sec", 15))
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if bool(opt.get("rebaseline_on_start", False)):
+        for path in (CALIBRATION_FILE, TEMPLATE_FILE):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        log("Referenzkalibrierung auf Wunsch zurückgesetzt.")
+
+    cal = load_calibration()
+    manual = manual_geometry(opt)
+    if cal:
+        baseline = {"cx": float(cal["baseline_cx"]), "cy": float(cal["baseline_cy"]), "r": float(cal["baseline_r"]), "source": "baseline", "score": 1.0}
+        current = {"cx": float(cal.get("current_cx", cal["baseline_cx"])), "cy": float(cal.get("current_cy", cal["baseline_cy"])), "r": float(cal.get("current_r", cal["baseline_r"])), "source": "saved", "score": 1.0}
+    else:
+        baseline = None
+        current = manual.copy()
+
+    interval = int(opt.get("interval_sec", 60))
+    capture_timeout = int(opt.get("capture_timeout_sec", 12))
+    max_backoff = int(opt.get("backoff_max_sec", 300))
+    locate_interval = int(opt.get("auto_locate_interval_sec", 600))
+    locate_after_invalid = int(opt.get("auto_locate_after_invalid", 2))
     median_window = max(1, int(opt.get("median_window", 5)))
     confidence_min = float(opt.get("confidence_min", 1.0))
     failures_limit = max(1, int(opt.get("failures_until_unavailable", 3)))
-
     history = deque(maxlen=median_window)
-    failures = 0
 
     client = mqtt_client_from_options(opt)
     publish_discovery(client, opt)
-
     base = opt["mqtt_base_topic"].rstrip("/")
     state_topic = f"{base}/state"
     avail_topic = f"{base}/availability"
+    pressure_avail = f"{base}/pressure_availability"
+
+    capture_failures = 0
+    invalid_count = 0
+    last_locate = 0.0
+    gauge_found = baseline is not None
 
     log("MQTT verbunden und Discovery veröffentlicht.")
-    log("Starte Messschleife.")
+    log("Starte Messschleife (CPU-schonend, Standardintervall 60 s).")
 
     while True:
         started = time.time()
-
         try:
-            frame = capture_rtsp_frame(opt["rtsp_url"])
+            frame = capture_rtsp_frame(opt["rtsp_url"], timeout=capture_timeout)
+            capture_failures = 0
+            now = time.time()
 
-            roi_x = int(opt["roi_x"])
-            roi_y = int(opt["roi_y"])
-            roi_w = int(opt["roi_w"])
-            roi_h = int(opt["roi_h"])
-
-            roi = crop_roi(frame, roi_x, roi_y, roi_w, roi_h)
-
-            result = detect_needle(
-                roi=roi,
-                center_x=int(opt["center_x"]),
-                center_y=int(opt["center_y"]),
-                radius=int(opt["radius"]),
-                angle_min_deg=float(opt["angle_min_deg"]),
-                angle_max_deg=float(opt["angle_max_deg"]),
-                scale_min=float(opt["scale_min"]),
-                scale_max=float(opt["scale_max"]),
-                clockwise=bool(opt["clockwise"]),
-                search_max_value=float(opt["search_max_value"]),
-                scan_inner_ratio=float(opt["scan_inner_ratio"]),
-                scan_outer_ratio=float(opt["scan_outer_ratio"]),
-                line_half_width_px=int(opt["line_half_width_px"]),
-                processing_scale=int(opt["processing_scale"]),
+            should_locate = bool(opt.get("auto_locate", True)) and (
+                baseline is None or not gauge_found or (now - last_locate) >= locate_interval or invalid_count >= locate_after_invalid
             )
 
-            valid = result["confidence"] >= confidence_min
+            locator_score = float(current.get("score", 0.0))
+            if should_locate:
+                found = auto_locate(frame, current, baseline, opt)
+                last_locate = now
+                if found is not None:
+                    current = found
+                    locator_score = float(found.get("score", 0.0))
+                    gauge_found = True
+                    if baseline is None:
+                        baseline = current.copy()
+                        create_template(frame, baseline)
+                        log(f"Referenz automatisch angelegt: x={baseline['cx']:.1f}, y={baseline['cy']:.1f}, r={baseline['r']:.1f}")
+                    elif not TEMPLATE_FILE.exists():
+                        create_template(frame, baseline)
+                    save_calibration(baseline, current)
+                    invalid_count = 0
+                    log(f"Manometer lokalisiert: x={current['cx']:.1f}, y={current['cy']:.1f}, r={current['r']:.1f}, Quelle={current['source']}, score={locator_score:.2f}")
+                else:
+                    gauge_found = False
+                    invalid_count += 1
+                    log("WARNUNG: Manometer im Kamerabild nicht gefunden.")
 
-            if valid:
-                history.append(float(result["pressure_raw"]))
-                filtered = float(statistics.median(history))
-                failures = 0
+            moved, movement_px, radius_change_pct = movement_state(current, baseline, opt)
+
+            if not gauge_found:
+                client.publish(pressure_avail, "offline", qos=1, retain=True)
+                payload = {
+                    "pressure": None, "raw_pressure": None, "angle_deg": None, "confidence": 0.0,
+                    "valid": False, "gauge_found": False, "camera_moved": False,
+                    "gauge_x": round(current["cx"], 1), "gauge_y": round(current["cy"], 1), "gauge_radius": round(current["r"], 1),
+                    "movement_px": round(movement_px, 1), "radius_change_percent": round(radius_change_pct, 1),
+                    "locator_score": round(locator_score, 3), "status": "manometer_nicht_gefunden", "last_measurement": iso_now(),
+                }
+                client.publish(state_topic, json.dumps(payload), qos=1, retain=True)
                 client.publish(avail_topic, "online", qos=1, retain=True)
+                sleep_for = interval
             else:
-                filtered = float(statistics.median(history)) if history else float(result["pressure_raw"])
-                failures += 1
+                roi, roi_x, roi_y, rcx, rcy = build_roi_from_geometry(frame, current)
+                result = detect_needle(roi, rcx, rcy, current["r"], opt)
+                valid = result["confidence"] >= confidence_min
+                if valid:
+                    history.append(float(result["pressure_raw"]))
+                    filtered = float(statistics.median(history))
+                    invalid_count = 0
+                    client.publish(pressure_avail, "online", qos=1, retain=True)
+                else:
+                    filtered = float(statistics.median(history)) if history else float(result["pressure_raw"])
+                    invalid_count += 1
+                    if invalid_count >= failures_limit:
+                        client.publish(pressure_avail, "offline", qos=1, retain=True)
 
-            payload = {
-                "pressure": round(filtered, 3),
-                "raw_pressure": round(float(result["pressure_raw"]), 3),
-                "angle_deg": round(float(result["angle_deg"]), 2),
-                "confidence": round(float(result["confidence"]), 3),
-                "valid": bool(valid),
-                "last_measurement": iso_now(),
-                "roi": [roi_x, roi_y, roi_w, roi_h],
-            }
+                status = "kamera_verschoben_nachgefuehrt" if moved else ("ok" if valid else "zeiger_unsicher")
+                payload = {
+                    "pressure": round(filtered, 3),
+                    "raw_pressure": round(float(result["pressure_raw"]), 3),
+                    "angle_deg": round(float(result["angle_deg"]), 2),
+                    "confidence": round(float(result["confidence"]), 3),
+                    "valid": bool(valid),
+                    "gauge_found": True,
+                    "camera_moved": bool(moved),
+                    "gauge_x": round(current["cx"], 1),
+                    "gauge_y": round(current["cy"], 1),
+                    "gauge_radius": round(current["r"], 1),
+                    "movement_px": round(movement_px, 1),
+                    "radius_change_percent": round(radius_change_pct, 1),
+                    "locator_score": round(locator_score, 3),
+                    "status": status,
+                    "last_measurement": iso_now(),
+                }
+                client.publish(state_topic, json.dumps(payload), qos=1, retain=True)
+                client.publish(avail_topic, "online", qos=1, retain=True)
 
-            client.publish(
-                state_topic,
-                json.dumps(payload),
-                qos=1,
-                retain=True,
-            )
+                if bool(opt.get("debug", True)):
+                    save_debug(frame, current, baseline, roi, roi_x, roi_y, rcx, rcy, result, filtered, valid, gauge_found, moved, locator_score)
 
-            if failures >= failures_limit:
-                client.publish(avail_topic, "offline", qos=1, retain=True)
-
-            if bool(opt.get("debug", True)):
-                save_debug(
-                    full_frame=frame,
-                    roi=roi,
-                    roi_x=roi_x,
-                    roi_y=roi_y,
-                    center_x=int(opt["center_x"]),
-                    center_y=int(opt["center_y"]),
-                    radius=int(opt["radius"]),
-                    result=result,
-                    filtered_pressure=filtered,
-                    valid=valid,
+                log(
+                    f"raw={result['pressure_raw']:.2f} bar | median={filtered:.2f} bar | "
+                    f"Winkel={result['angle_deg']:.1f}° | confidence={result['confidence']:.2f} | "
+                    f"valid={valid} | gauge=({current['cx']:.0f},{current['cy']:.0f},r{current['r']:.0f}) | moved={moved}"
                 )
-
-            log(
-                f"raw={result['pressure_raw']:.2f} bar | "
-                f"median={filtered:.2f} bar | "
-                f"Winkel={result['angle_deg']:.1f}° | "
-                f"confidence={result['confidence']:.2f} | "
-                f"valid={valid}"
-            )
+                sleep_for = interval
 
         except Exception as exc:
-            failures += 1
+            capture_failures += 1
             log(f"FEHLER: {exc}")
-
-            if failures >= failures_limit:
+            if capture_failures >= failures_limit:
                 try:
-                    client.publish(avail_topic, "offline", qos=1, retain=True)
+                    client.publish(pressure_avail, "offline", qos=1, retain=True)
                 except Exception:
                     pass
+            # Bei RTSP-/Systemfehlern exponentiell langsamer erneut versuchen.
+            sleep_for = min(max_backoff, interval * (2 ** min(capture_failures, 4)))
+            log(f"Nächster Versuch in ca. {sleep_for} s (Backoff).")
 
         elapsed = time.time() - started
-        time.sleep(max(1.0, interval - elapsed))
+        time.sleep(max(1.0, float(sleep_for) - elapsed))
 
 
 if __name__ == "__main__":
