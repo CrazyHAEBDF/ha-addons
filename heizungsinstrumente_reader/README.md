@@ -1,4 +1,18 @@
-# Heizungs Instrument Reader 1.0.0
+# Heizungs Instrument Reader 1.0.1
+
+## Neu in 1.0.1
+
+- anhand der Nahaufnahme korrigierte Thermometerskala: 20 °C bei 305°,
+  60 °C bei 270° und 100 °C bei 235°
+- stärkere Gewichtung einer durchgehenden dunklen Linie direkt ab Drehpunkt;
+  Skalenstriche und Beschriftung am Außenrand werden geringer gewichtet
+- getrennte Confidence-Grenzen für Druck und Temperaturen
+- drei konsistente Startmessungen vor der ersten Freigabe
+- einzelne Sprünge über 3 °C beziehungsweise 0,15 bar werden verworfen
+- ein größerer neuer Messwert wird erst nach vier konsistenten Wiederholungen
+  akzeptiert, damit reale länger anhaltende Änderungen weiterhin möglich sind
+- Log zeigt Rohwert, gefilterten Wert und den jeweiligen Filtergrund
+- FFmpeg-Fehler geben die RTSP-Adresse und Zugangsdaten nicht mehr aus
 
 Gemeinsame Home-Assistant-App für drei analoge Heizungsinstrumente:
 
@@ -97,6 +111,6 @@ den bisherigen Apps verwenden. Die gemeinsame App besitzt mit
 `heizung/instrumente` ein eigenes MQTT-Basistopic und mit
 `ha_instrument_reader` einen eigenen Clientnamen.
 
-Die Thermometerskala ist auf 20 °C bei 315°, 60 °C bei 270° und 100 °C bei
-225° eingestellt. Der Drehpunktversatz `-0.55 × Radius` folgt der gelieferten
+Die Thermometerskala ist auf 20 °C bei 305°, 60 °C bei 270° und 100 °C bei
+235° eingestellt. Der Drehpunktversatz `-0.55 × Radius` folgt der gelieferten
 Nahaufnahme. Die Druckskala übernimmt 0–4 bar aus dem bisherigen Reader.

@@ -60,8 +60,9 @@ def capture_rtsp_frame(rtsp_url, timeout=12):
         raise RuntimeError("RTSP/ffmpeg Timeout") from exc
 
     if p.returncode != 0 or not p.stdout:
-        err = p.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"ffmpeg konnte kein Bild lesen: {err[-700:]}")
+        # ffmpeg echoes the complete input URL, potentially including credentials.
+        # Never copy stderr into the Home Assistant log.
+        raise RuntimeError("ffmpeg konnte kein Bild lesen (RTSP-Verbindung oder Kamerazugriff abgelehnt)")
 
     arr = np.frombuffer(p.stdout, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -468,8 +469,9 @@ def detect_needle(roi, center_x, center_y, radius, opt, angle_offset_deg=0.0):
     r_start = scan_inner_ratio * rad
     r_end = scan_outer_ratio * rad
     radii = np.linspace(r_start, r_end, max(10, int(r_end - r_start) + 1), dtype=np.float32)
-    # Äußeren Bereich stärker gewichten: bevorzugt den langen dünnen Messzeiger gegenüber dem kurzen breiten Gegengewicht.
-    radial_weights = np.linspace(0.55, 2.25, len(radii), dtype=np.float32)
+    weight_inner = float(opt.get("radial_weight_inner", 1.0))
+    weight_outer = float(opt.get("radial_weight_outer", 1.0))
+    radial_weights = np.linspace(weight_inner, weight_outer, len(radii), dtype=np.float32)
 
     scores = np.zeros(len(deltas), dtype=np.float32)
     h, w = darkness.shape[:2]
@@ -482,6 +484,8 @@ def detect_needle(roi, center_x, center_y, radius, opt, angle_offset_deg=0.0):
         weighted_sum = 0.0
         weight_sum = 0.0
         continuity_hits = 0
+        inner_hits = 0
+        inner_samples = 0
         samples = 0
 
         for ridx, r in enumerate(radii):
@@ -500,11 +504,19 @@ def detect_needle(roi, center_x, center_y, radius, opt, angle_offset_deg=0.0):
                 samples += 1
                 if v >= 55.0:
                     continuity_hits += 1
+                if ridx < max(3, int(len(radii) * 0.55)):
+                    inner_samples += 1
+                    if v >= 55.0:
+                        inner_hits += 1
 
         if weight_sum > 0:
             darkness_score = weighted_sum / weight_sum
             continuity = continuity_hits / max(samples, 1)
-            scores[i] = darkness_score * (0.70 + 0.30 * continuity)
+            inner_continuity = inner_hits / max(inner_samples, 1)
+            inner_factor = float(opt.get("inner_continuity_weight", 0.30))
+            scores[i] = darkness_score * (
+                max(0.20, 0.70 - inner_factor) + 0.30 * continuity + inner_factor * inner_continuity
+            )
 
     smooth = cv2.GaussianBlur(scores.reshape(1, -1), (0, 0), 1.2).ravel()
     best_idx = int(np.argmax(smooth))
@@ -741,7 +753,10 @@ def main():
     locate_interval = int(opt.get("auto_locate_interval_sec", 600))
     locate_after_invalid = int(opt.get("auto_locate_after_invalid", 2))
     median_window = max(1, int(opt.get("median_window", 5)))
-    confidence_min = float(opt.get("confidence_min", 1.0))
+    thermometer_confidence_min = float(opt.get("thermometer_confidence_min", 1.15))
+    pressure_confidence_min = float(opt.get("pressure_confidence_min", 1.15))
+    bootstrap_required = int(opt.get("bootstrap_confirmations", 3))
+    change_required = int(opt.get("change_confirmations", 4))
     failures_limit = max(1, int(opt.get("failures_until_unavailable", 3)))
     confirmations_required = max(1, int(opt.get("cluster_confirmations", 3)))
     history = deque(maxlen=median_window)
@@ -929,8 +944,8 @@ def encode_jpeg(image, quality=82):
 
 def thermometer_options(opt):
     return {
-        "angle_min_deg": float(opt.get("thermometer_angle_20_deg", 315.0)),
-        "angle_max_deg": float(opt.get("thermometer_angle_100_deg", 225.0)),
+        "angle_min_deg": float(opt.get("thermometer_calibrated_angle_20_deg", 305.0)),
+        "angle_max_deg": float(opt.get("thermometer_calibrated_angle_100_deg", 235.0)),
         "scale_min": 20.0,
         "scale_max": 100.0,
         "clockwise": True,
@@ -939,6 +954,9 @@ def thermometer_options(opt):
         "scan_outer_ratio": float(opt.get("thermometer_scan_outer_ratio", 0.98)),
         "line_half_width_px": int(opt.get("line_half_width_px", 1)),
         "processing_scale": int(opt.get("thermometer_processing_scale", 4)),
+        "radial_weight_inner": 2.0,
+        "radial_weight_outer": 0.45,
+        "inner_continuity_weight": 0.45,
     }
 
 
@@ -952,7 +970,53 @@ def pressure_options(opt):
         "scan_outer_ratio": float(opt.get("pressure_scan_outer_ratio", 0.92)),
         "line_half_width_px": int(opt.get("line_half_width_px", 1)),
         "processing_scale": int(opt.get("pressure_processing_scale", 3)),
+        "radial_weight_inner": 1.35,
+        "radial_weight_outer": 0.80,
+        "inner_continuity_weight": 0.40,
     }
+
+
+def stabilize_measurement(state, raw_value, confidence_ok, max_change, bootstrap_required, change_required):
+    """Reject isolated jumps while still allowing a sustained real change."""
+    if not confidence_ok:
+        return state.get("accepted", raw_value), False, "confidence_low"
+
+    accepted = state.get("accepted")
+    if accepted is None:
+        samples = state.setdefault("bootstrap", deque(maxlen=bootstrap_required))
+        samples.append(float(raw_value))
+        if len(samples) < bootstrap_required:
+            return float(statistics.median(samples)), False, f"bootstrap_{len(samples)}/{bootstrap_required}"
+        if max(samples) - min(samples) <= max_change * 2.0:
+            accepted = float(statistics.median(samples))
+            state["accepted"] = accepted
+            state["pending"] = None
+            state["pending_count"] = 0
+            return accepted, True, "accepted_initial"
+        samples.clear()
+        samples.append(float(raw_value))
+        return float(raw_value), False, "bootstrap_unstable"
+
+    if abs(float(raw_value) - accepted) <= max_change:
+        state["accepted"] = float(raw_value)
+        state["pending"] = None
+        state["pending_count"] = 0
+        return float(raw_value), True, "accepted"
+
+    pending = state.get("pending")
+    if pending is not None and abs(float(raw_value) - pending) <= max_change:
+        state["pending"] = (pending * state.get("pending_count", 1) + float(raw_value)) / (state.get("pending_count", 1) + 1)
+        state["pending_count"] = state.get("pending_count", 1) + 1
+    else:
+        state["pending"] = float(raw_value)
+        state["pending_count"] = 1
+
+    if state["pending_count"] >= change_required:
+        state["accepted"] = float(state["pending"])
+        state["pending"] = None
+        state["pending_count"] = 0
+        return state["accepted"], True, "accepted_sustained_change"
+    return accepted, False, f"jump_rejected_{state['pending_count']}/{change_required}"
 
 
 def publish_instrument_discovery(client, opt):
@@ -964,7 +1028,7 @@ def publish_instrument_discovery(client, opt):
         "identifiers": ["heizung_instrument_reader"],
         "name": "Heizungsinstrumente",
         "manufacturer": "Custom",
-        "model": "RTSP/OpenCV Instrument Reader 1.0.0",
+        "model": "RTSP/OpenCV Instrument Reader 1.0.1",
     }
     entities = []
     for key, oid, name in (
@@ -1105,6 +1169,7 @@ def instrument_main():
     confidence_min = float(opt.get("confidence_min", 1.0))
     failures_limit = int(opt.get("failures_until_unavailable", 3))
     histories = {key: deque(maxlen=int(opt.get("median_window", 5))) for key in ("return", "supply", "pressure")}
+    stability = {key: {"accepted": None, "pending": None, "pending_count": 0} for key in ("return", "supply", "pressure")}
     client = mqtt_client_from_options(opt)
     publish_instrument_discovery(client, opt)
     base = opt["mqtt_base_topic"].rstrip("/")
@@ -1174,35 +1239,52 @@ def instrument_main():
                     cx += float(opt.get("thermometer_needle_center_x_ratio",0.0))*item["r"]
                     cy += float(opt.get("thermometer_needle_center_y_ratio",-0.55))*item["r"]
                     result = detect_needle(roi,cx,cy,item["r"],thermometer_options(opt),angle_offset_deg=-rotation)
-                    valid = result["confidence"] >= confidence_min
-                    if valid: histories[key].append(result["pressure_raw"])
-                    value = statistics.median(histories[key]) if histories[key] else result["pressure_raw"]
+                    confidence_ok = result["confidence"] >= thermometer_confidence_min
+                    value, valid, reason = stabilize_measurement(
+                        stability[key], result["pressure_raw"], confidence_ok,
+                        float(opt.get("thermometer_max_change_per_cycle",3.0)),
+                        bootstrap_required, change_required,
+                    )
+                    if valid:
+                        histories[key].append(value)
+                        value = float(statistics.median(histories[key]))
                     results[key] = (value,result,valid)
+                    results[f"{key}_reason"] = reason
                     debug_data[key] = (roi,cx,cy,item["r"],result,value,valid)
                 item = current_cluster["gauge"]
                 roi,x1,y1,cx,cy = build_roi_from_geometry(frame,item)
                 pressure_result = detect_needle(roi,cx,cy,item["r"],pressure_options(opt),angle_offset_deg=-rotation)
-                pressure_valid = pressure_result["confidence"] >= confidence_min
+                pressure_confidence_ok = pressure_result["confidence"] >= pressure_confidence_min
+                pressure_value, pressure_valid, pressure_reason = stabilize_measurement(
+                    stability["pressure"], pressure_result["pressure_raw"], pressure_confidence_ok,
+                    float(opt.get("pressure_max_change_per_cycle",0.15)),
+                    bootstrap_required, change_required,
+                )
                 if pressure_valid:
-                    histories["pressure"].append(pressure_result["pressure_raw"])
-                pressure_value = statistics.median(histories["pressure"]) if histories["pressure"] else pressure_result["pressure_raw"]
+                    histories["pressure"].append(pressure_value)
+                    pressure_value = float(statistics.median(histories["pressure"]))
                 results["pressure"] = (pressure_value,pressure_result,pressure_valid)
+                results["pressure_reason"] = pressure_reason
                 debug_data["pressure"] = (roi,cx,cy,item["r"],pressure_result,pressure_value,pressure_valid)
                 all_valid = all(results[key][2] for key in ("return","supply","pressure"))
-                invalid_count = 0 if all_valid else invalid_count+1
+                if any(stability[key].get("accepted") is None for key in ("return","supply","pressure")):
+                    invalid_count = 0
+                else:
+                    invalid_count = 0 if all_valid else invalid_count+1
                 payload = {
                     "return_temperature": round(results["return"][0],2), "supply_temperature": round(results["supply"][0],2), "pressure": round(results["pressure"][0],3),
                     "return_raw": round(results["return"][1]["pressure_raw"],2), "supply_raw": round(results["supply"][1]["pressure_raw"],2),
                     "pressure_raw": round(results["pressure"][1]["pressure_raw"],3),
+                    "return_filter": results["return_reason"], "supply_filter": results["supply_reason"], "pressure_filter": results["pressure_reason"],
                     "return_valid": results["return"][2], "supply_valid": results["supply"][2], "pressure_valid": results["pressure"][2], "cluster_found": True,
                     "return_confidence": round(results["return"][1]["confidence"],3), "supply_confidence": round(results["supply"][1]["confidence"],3), "pressure_confidence": round(results["pressure"][1]["confidence"],3),
                     "cluster_score": round(score,3), "camera_rotation_deg": round(rotation,2),
-                    "status": "ok" if invalid_count==0 else "zeiger_unsicher", "last_measurement": iso_now(),
+                    "status": ("stabilisierung" if any(stability[key].get("accepted") is None for key in ("return","supply","pressure")) else ("ok" if invalid_count==0 else "zeiger_unsicher")), "last_measurement": iso_now(),
                 }
                 for key in ("return","supply"):
-                    availability = "online" if results[key][2] or invalid_count < failures_limit else "offline"
+                    availability = "online" if stability[key].get("accepted") is not None and (results[key][2] or invalid_count < failures_limit) else "offline"
                     client.publish(f"{base}/{key}_temperature/availability", availability, qos=1, retain=True)
-                pressure_availability = "online" if results["pressure"][2] or invalid_count < failures_limit else "offline"
+                pressure_availability = "online" if stability["pressure"].get("accepted") is not None and (results["pressure"][2] or invalid_count < failures_limit) else "offline"
                 client.publish(f"{base}/pressure/availability", pressure_availability, qos=1, retain=True)
                 client.publish(f"{base}/state", json.dumps(payload), qos=1, retain=True)
                 client.publish(f"{base}/availability", "online", qos=1, retain=True)
@@ -1212,7 +1294,11 @@ def instrument_main():
                     client.publish(f"{base}/debug/return",rb,qos=0,retain=True)
                     client.publish(f"{base}/debug/supply",sb,qos=0,retain=True)
                     client.publish(f"{base}/debug/pressure",pb,qos=0,retain=True)
-                log(f"Druck={results['pressure'][0]:.2f} bar | Rücklauf={results['return'][0]:.1f} °C | Zulauf={results['supply'][0]:.1f} °C")
+                log(
+                    f"Druck raw={results['pressure'][1]['pressure_raw']:.2f} -> {results['pressure'][0]:.2f} bar ({results['pressure_reason']}) | "
+                    f"Rücklauf raw={results['return'][1]['pressure_raw']:.1f} -> {results['return'][0]:.1f} °C ({results['return_reason']}) | "
+                    f"Zulauf raw={results['supply'][1]['pressure_raw']:.1f} -> {results['supply'][0]:.1f} °C ({results['supply_reason']})"
+                )
             sleep_for = interval
         except Exception as exc:
             capture_failures += 1
